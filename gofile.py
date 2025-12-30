@@ -155,8 +155,6 @@ class Downloader:
             url: str = file_info["link"]
 
             headers: dict[str, str] = {}
-
-            # Vòng lặp thử lại (Retry loop)
             for attempt in range(self._number_retries):
                 try:
                     part_size: int = 0
@@ -164,7 +162,6 @@ class Downloader:
                         part_size = int(path.getsize(tmp_file))
                         headers = {"Range": f"bytes={part_size}-"}
 
-                    # Thực hiện download
                     has_size: str | None = self._perform_download(
                         file_info,
                         url,
@@ -172,16 +169,12 @@ class Downloader:
                         headers,
                         part_size
                     )
-                
-                # --- PHẦN SỬA ĐỔI QUAN TRỌNG ---
+
                 except Exception as e:
-                    # Bắt tất cả các lỗi (Timeout, ConnectionError, ChunkedEncodingError...)
                     _print(f"{TERMINAL_CLEAR_LINE}Error downloading {file_info['filename']}: {str(e)}. Retrying ({attempt + 1}/{self._number_retries})...{NEW_LINE}", True)
                     from time import sleep
-                    sleep(2) # Nghỉ 2 giây trước khi thử lại
+                    sleep(2) 
                     continue
-                # -------------------------------
-
                 else:
                     if has_size:
                         self._finalize_download(file_info, tmp_file, has_size)
@@ -599,4 +592,5 @@ if __name__ == "__main__":
             f"python gofile-downloader.py https://gofile.io/d/contentid"
             f"{NEW_LINE}"
             f"python gofile-downloader.py https://gofile.io/d/contentid password"
+
         )
