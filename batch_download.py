@@ -31,6 +31,52 @@ from collections import deque
 if sys.stdout is not None and getattr(sys.stdout, "encoding", "").lower() != "utf-8":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
+class TeeLogger:
+    def __init__(self, original_stream, log_file_handle, lock=None):
+        self._original = original_stream
+        self._log_file = log_file_handle
+        self._lock = lock or threading.Lock()
+
+    def write(self, message):
+        if not message:
+            return 0
+        with self._lock:
+            try:
+                self._original.write(message)
+            except Exception:
+                pass
+            try:
+                self._log_file.write(message)
+            except Exception:
+                pass
+            try:
+                self._original.flush()
+            except Exception:
+                pass
+            try:
+                self._log_file.flush()
+            except Exception:
+                pass
+        return len(message)
+
+    def flush(self):
+        with self._lock:
+            try:
+                self._original.flush()
+            except Exception:
+                pass
+            try:
+                self._log_file.flush()
+            except Exception:
+                pass
+
+    @property
+    def encoding(self):
+        try:
+            return self._original.encoding
+        except Exception:
+            return "utf-8"
+
 STOP_EVENT = threading.Event()
 FILE_LOCK = threading.Lock()
 HEADERS = {
@@ -542,19 +588,32 @@ def get_gofile_content_data(content_id, token, password=None):
     if password:
         hashed = hashlib.sha256(password.encode()).hexdigest()
         api_url = f"{api_url}&password={hashed}"
+    if not token:
+        print("DEBUG GoFile API FAIL: missing token for content request")
+        return None
     headers = {
         "User-Agent": HEADERS["User-Agent"],
         "Accept-Encoding": "gzip, deflate, br",
         "Accept": "*/*",
         "Connection": "keep-alive",
         "Authorization": f"Bearer {token}",
+        "X-Website-Token": "4fd6sg89d7s6",
+        "Cookie": f"accountToken={token}",
         "Referer": "https://gofile.io/",
         "Origin": "https://gofile.io"
     }
     response = requests.get(api_url, headers=headers, timeout=30).json()
     if response.get("status") != "ok":
+        print(f"DEBUG GoFile API FAIL: {json.dumps(response, indent=2, ensure_ascii=False)}")
         return None
-    return response.get("data")
+    data = response.get("data")
+    if isinstance(data, dict):
+        children = data.get("children")
+        child_count = len(children) if isinstance(children, dict) else (len(children) if isinstance(children, list) else 0)
+        print(f"DEBUG GoFile API ok content_id={content_id}: data_keys={list(data.keys())} children_count={child_count}")
+    else:
+        print(f"DEBUG GoFile API ok content_id={content_id}: data_type={type(data).__name__}")
+    return data
 
 def recursive_extract_gofile_links(content_id, token, password=None, parent_path="", is_root=False):
     data = get_gofile_content_data(content_id, token, password)
@@ -571,9 +630,17 @@ def recursive_extract_gofile_links(content_id, token, password=None, parent_path
         folder_name = data.get("name") or ""
         current_path = os.path.join(parent_path, folder_name) if parent_path else folder_name
     children = data.get("children", {})
+    if not isinstance(children, dict):
+        print(f"DEBUG GoFile recursion content_id={content_id}: children_type={type(children).__name__} (expected dict)")
+        children = {}
+    print(f"DEBUG GoFile recursion content_id={content_id}: iterating children.values() count={len(children)}")
     for child in children.values():
         if child.get("type") == "folder":
-            links.extend(recursive_extract_gofile_links(child.get("id"), token, password, current_path, False))
+            child_id = child.get("id")
+            if not child_id:
+                print(f"DEBUG GoFile recursion: folder missing id under parent content_id={content_id} child_keys={list(child.keys())}")
+                continue
+            links.extend(recursive_extract_gofile_links(child_id, token, password, current_path, False))
         else:
             links.append({"url": child.get("link"), "name": child.get("name"), "rel_path": current_path})
     return links
@@ -658,6 +725,10 @@ def download_from_gofile(url, base_folder, status_label=None, progress_var=None)
             set_status("No files found to download from GoFile")
             log_failure(main_gofile_folder, url, "No files found")
             return
+        if isinstance(data, dict):
+            children = data.get("children")
+            child_count = len(children) if isinstance(children, dict) else (len(children) if isinstance(children, list) else 0)
+            print(f"DEBUG GoFile root content_id={content_id}: data_keys={list(data.keys())} children_count={child_count}")
         if "password" in data and data.get("passwordStatus") and data.get("passwordStatus") != "passwordOk":
             password = show_password_dialog()
             if not password:
@@ -669,6 +740,10 @@ def download_from_gofile(url, base_folder, status_label=None, progress_var=None)
                 set_status("No files found to download from GoFile")
                 log_failure(main_gofile_folder, url, "No files found")
                 return
+            if isinstance(data, dict):
+                children = data.get("children")
+                child_count = len(children) if isinstance(children, dict) else (len(children) if isinstance(children, list) else 0)
+                print(f"DEBUG GoFile root (after password) content_id={content_id}: data_keys={list(data.keys())} children_count={child_count}")
         root_name = clean_filename(data.get("name") or "GoFile")
         file_links = recursive_extract_gofile_links(content_id, token, password, "", True)
         if not file_links:
@@ -696,10 +771,11 @@ def download_from_gofile(url, base_folder, status_label=None, progress_var=None)
         if total_files > 0 and completed:
             set_progress((completed / total_files) * 100)
         download_headers = {
-            "Cookie": f"accountToken={token}",
             "Referer": "https://gofile.io/",
             "Origin": "https://gofile.io"
         }
+        if token:
+            download_headers["Cookie"] = f"accountToken={token}"
         def download_item(file_info):
             file_url = file_info.get("url")
             if STOP_EVENT.is_set():
@@ -1195,6 +1271,13 @@ def process_download_queue():
 def download_complete_callback():
     global is_downloading
     is_downloading = False
+    if STOP_EVENT.is_set():
+        print("Batch stopped by user")
+        set_status("Batch stopped by user")
+        update_stats(stats_text, "Batch stopped by user")
+        set_button_state(download_button, "normal")
+        set_button_state(cancel_button, "disabled")
+        return
     set_button_state(download_button, "normal")
     set_button_state(cancel_button, "disabled")
     if download_queue:
@@ -1803,5 +1886,22 @@ def download_from_rubyvid(url, base_folder, status_label=None, progress_var=None
         download_complete_callback()
 
 if __name__ == "__main__":
+    log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "session_debug.log")
+    try:
+        _session_log_file = open(log_path, "a", encoding="utf-8", buffering=1)
+        _tee_lock = threading.Lock()
+        _orig_out = sys.stdout
+        _orig_err = sys.stderr
+        sys.stdout = TeeLogger(_orig_out, _session_log_file, lock=_tee_lock)
+        sys.stderr = TeeLogger(_orig_err, _session_log_file, lock=_tee_lock)
+        print("\n" + "=" * 80)
+        print(f"Session started: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"Log file: {log_path}")
+        print("=" * 80 + "\n")
+    except Exception as e:
+        try:
+            print(f"Failed to initialize session logger: {e}")
+        except Exception:
+            pass
     root, url_entry, folder_entry, progress_var, status_label, download_button, stats_text = create_gui()
     root.mainloop()
