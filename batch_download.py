@@ -28,6 +28,10 @@ from tenacity import retry, wait_exponential, stop_after_attempt
 from concurrent.futures import ThreadPoolExecutor
 from collections import deque
 
+APP_VERSION = "1.0.0"
+UPDATE_RAW_URL = "https://raw.githubusercontent.com/WhiteSnow00/personal_app/main/batch_download.py"
+UPDATE_APPLY_ARG = "--apply-update"
+
 if sys.stdout is not None and getattr(sys.stdout, "encoding", "").lower() != "utf-8":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
@@ -76,6 +80,130 @@ class TeeLogger:
             return self._original.encoding
         except Exception:
             return "utf-8"
+
+def check_for_updates():
+    try:
+        from packaging.version import Version, InvalidVersion
+    except Exception:
+        Version = None
+        InvalidVersion = Exception
+
+    try:
+        import pyuac  # type: ignore
+    except Exception:
+        pyuac = None
+
+    def is_user_admin():
+        if pyuac is not None:
+            try:
+                return bool(pyuac.isUserAdmin())
+            except Exception:
+                pass
+        try:
+            import ctypes
+            return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        except Exception:
+            return False
+
+    def run_as_admin(extra_args=None):
+        extra_args = extra_args or []
+        if pyuac is not None:
+            try:
+                cmd = [sys.executable, os.path.abspath(__file__), *extra_args]
+                pyuac.runAsAdmin(cmdLine=cmd, wait=False)
+                return True
+            except Exception:
+                pass
+        try:
+            import ctypes
+            params = " ".join([f"\"{a}\"" for a in [os.path.abspath(__file__), *extra_args]])
+            ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, None, 1)
+            return True
+        except Exception:
+            return False
+
+    def with_temp_root(fn):
+        temp_root = tk.Tk()
+        temp_root.withdraw()
+        try:
+            return fn(temp_root)
+        finally:
+            try:
+                temp_root.destroy()
+            except Exception:
+                pass
+
+    def ask_yes_no(title, message):
+        def _ask(parent):
+            return messagebox.askyesno(title, message, parent=parent)
+        return with_temp_root(_ask)
+
+    def show_info(title, message):
+        def _info(parent):
+            messagebox.showinfo(title, message, parent=parent)
+        return with_temp_root(_info)
+
+    def show_error_dialog(title, message):
+        def _err(parent):
+            messagebox.showerror(title, message, parent=parent)
+        return with_temp_root(_err)
+
+    try:
+        remote_resp = requests.get(UPDATE_RAW_URL, timeout=30)
+        remote_resp.raise_for_status()
+        remote_text = remote_resp.text
+    except Exception as e:
+        print(f"Update check failed: {e}")
+        return False
+
+    m = re.search(r'^\s*APP_VERSION\s*=\s*[\"\']([^\"\']+)[\"\']\s*$', remote_text, re.MULTILINE)
+    if not m:
+        print("Update check: remote APP_VERSION not found")
+        return False
+
+    remote_version_str = m.group(1).strip()
+    local_version_str = str(APP_VERSION).strip()
+
+    try:
+        if Version is None:
+            is_newer = remote_version_str != local_version_str
+        else:
+            is_newer = Version(remote_version_str) > Version(local_version_str)
+    except InvalidVersion:
+        print(f"Update check: invalid version (local={local_version_str}, remote={remote_version_str})")
+        return False
+
+    if not is_newer:
+        return False
+
+    should_apply = UPDATE_APPLY_ARG in sys.argv
+    if not should_apply:
+        should_apply = ask_yes_no("Update Available", f"A new version (v{remote_version_str}) is available. Do you want to update?")
+    if not should_apply:
+        return False
+
+    if os.getcwd().startswith("C:") and not is_user_admin():
+        print("Update requires admin privileges on C: drive; relaunching as admin...")
+        ok = run_as_admin(extra_args=[UPDATE_APPLY_ARG])
+        if not ok:
+            show_error_dialog("Update Failed", "Admin privileges are required to update on C: drive, but elevation failed.")
+        raise SystemExit(0)
+
+    script_path = os.path.abspath(__file__)
+    try:
+        with open(script_path, "w", encoding="utf-8") as f:
+            f.write(remote_text)
+    except Exception as e:
+        show_error_dialog("Update Failed", f"Could not overwrite script:\n{e}")
+        return False
+
+    show_info("Update Complete", f"Updated to v{remote_version_str}. The app will restart now.")
+    try:
+        args = [a for a in sys.argv if a != UPDATE_APPLY_ARG]
+        subprocess.Popen([sys.executable, script_path, *args[1:]], cwd=os.getcwd())
+    except Exception:
+        pass
+    raise SystemExit(0)
 
 STOP_EVENT = threading.Event()
 FILE_LOCK = threading.Lock()
@@ -167,12 +295,24 @@ def update_stats(stats_widget, message):
 def update_theme_colors(stats_widget):
     current_theme = sv_ttk.get_theme()
     if current_theme == "dark":
-        stats_widget.configure(bg="#2b2b2b", fg="#e0e0e0")
+        stats_widget.configure(bg="#2b2b2b", fg="#e0e0e0", insertbackground="#e0e0e0")
     else:
-        stats_widget.configure(bg="#ffffff", fg="#000000")
+        stats_widget.configure(bg="#ffffff", fg="#000000", insertbackground="#000000")
+    try:
+        stats_widget.configure(borderwidth=0, highlightthickness=0, relief="flat", padx=8, pady=8)
+    except Exception:
+        pass
+
+def enforce_widget_styles():
+    style = ttk.Style()
+    style.configure("TButton", padding=(10, 5), font=("Segoe UI", 10))
+    style.configure("Accent.TButton", padding=(10, 5), font=("Segoe UI", 10))
+    style.configure("Secondary.TButton", padding=(10, 5), font=("Segoe UI", 9))
+    style.configure("TEntry", padding=5)
 
 def toggle_theme(stats_widget):
     sv_ttk.toggle_theme()
+    enforce_widget_styles()
     update_theme_colors(stats_widget)
 
 def make_progress_callback(label, update_progress=True):
@@ -1449,6 +1589,7 @@ def create_gui():
     root.geometry(f"{window_width}x{window_height}+{center_x}+{center_y}")
     root.minsize(800, 500)
     sv_ttk.set_theme("dark")
+    enforce_widget_styles()
     container = ttk.Frame(root)
     container.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
     left_panel = ttk.Frame(container)
@@ -1475,8 +1616,9 @@ def create_gui():
         font=("Segoe UI", 10)
     )
     subtitle_label.pack(anchor="w")
-    url_frame = ttk.LabelFrame(left_panel, text="Download Link", padding=15)
+    url_frame = ttk.LabelFrame(left_panel, text="Download Link", padding=15, height=90)
     url_frame.pack(fill=tk.X, pady=(0, 15))
+    url_frame.pack_propagate(False)
     batch_button = ttk.Button(
         url_frame,
         text="📂 Batch",
@@ -1490,8 +1632,9 @@ def create_gui():
         font=("Segoe UI", 10)
     )
     url_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
-    folder_frame = ttk.LabelFrame(left_panel, text="Main Folder (Album subfolder will be created automatically)", padding=15)
+    folder_frame = ttk.LabelFrame(left_panel, text="Main Folder (Album subfolder will be created automatically)", padding=15, height=90)
     folder_frame.pack(fill=tk.X, pady=(0, 15))
+    folder_frame.pack_propagate(False)
     folder_entry = ttk.Entry(
         folder_frame,
         font=("Segoe UI", 10)
@@ -1561,6 +1704,10 @@ def create_gui():
         bg="#2b2b2b",
         fg="#e0e0e0",
         relief="flat",
+        borderwidth=0,
+        highlightthickness=0,
+        padx=8,
+        pady=8,
         height=10
     )
     stats_text.pack(fill=tk.BOTH, expand=True)
@@ -1903,5 +2050,7 @@ if __name__ == "__main__":
             print(f"Failed to initialize session logger: {e}")
         except Exception:
             pass
+
+    check_for_updates()
     root, url_entry, folder_entry, progress_var, status_label, download_button, stats_text = create_gui()
     root.mainloop()
