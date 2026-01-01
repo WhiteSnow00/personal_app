@@ -177,6 +177,12 @@ def smart_download(url, folder, filename, progress_callback_func, headers=None):
                     if r.status_code not in (200, 206):
                         raise Exception(f"HTTP {r.status_code}")
                     total_size = int(r.headers.get("content-length", 0))
+                    if total_size > 0 and total_size < 1024 * 1024 and resume_byte_pos == 0:
+                        is_video = filename.lower().endswith((".mp4", ".mkv", ".ts", ".mov", ".avi", ".wmv", ".flv", ".webm"))
+                        if is_video:
+                            print(f"Skipping maintenance/deleted file: {filename} ({total_size} bytes)")
+                            log_failure(folder, url, "Maintenance/Small File")
+                            return False
                     if r.status_code == 206:
                         content_range = r.headers.get("content-range")
                         if content_range and "/" in content_range:
@@ -379,6 +385,17 @@ def append_history(folder, url):
         with open(path, "a", encoding="utf-8") as f:
             f.write(f"{url}\n")
 
+def log_failure(folder, url, reason):
+    try:
+        os.makedirs(folder, exist_ok=True)
+    except Exception:
+        folder = os.getcwd()
+    path = os.path.join(folder, "failed.txt")
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    with FILE_LOCK:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"[{timestamp}] {reason}: {url}\n")
+
 def build_download_filename(name, direct_url):
     parsed_path = urlparse(direct_url).path
     ext = os.path.splitext(parsed_path)[1]
@@ -400,6 +417,7 @@ def get_file_size(url, headers):
         return 0
 
 def download_from_bunkr(url, base_folder):
+    folder = base_folder
     try:
         session = requests.Session()
         session.headers.update({
@@ -419,8 +437,7 @@ def download_from_bunkr(url, base_folder):
         items = extract_links(url, session)
         if not items:
             set_status("No files found to download.")
-            set_button_state(download_button, "normal")
-            set_button_state(cancel_button, "disabled")
+            log_failure(folder, url, "No files found")
             return
         history = load_history(folder)
         image_exts = {"jpg", "jpeg", "png", "gif", "webp", "jfif"}
@@ -443,8 +460,7 @@ def download_from_bunkr(url, base_folder):
             pending.append((item, ext))
         if not pending:
             set_status("No new files to download.")
-            set_button_state(download_button, "normal")
-            set_button_state(cancel_button, "disabled")
+            log_failure(folder, url, "No new files")
             return
         total_files = len(pending)
         completed = 0
@@ -452,23 +468,24 @@ def download_from_bunkr(url, base_folder):
         failed = 0
         def download_item(item, ext):
             if STOP_EVENT.is_set():
-                return False, item.get("url"), ext
+                return False, item.get("url"), ext, None
             item_url = item.get("url")
             filename = build_download_filename(item.get("name"), item_url)
             headers = {"Referer": "https://bunkr.cr/"}
             ok = smart_download(item_url, folder, filename, make_progress_callback(filename, update_progress=False), headers=headers)
-            return ok, item_url, ext
+            return ok, item_url, ext, filename
         with ThreadPoolExecutor(max_workers=3) as executor:
             futures = [executor.submit(download_item, item, ext) for item, ext in pending]
             for future in concurrent.futures.as_completed(futures):
                 if STOP_EVENT.is_set():
                     break
                 try:
-                    ok, item_url, ext = future.result()
+                    ok, item_url, ext, filename = future.result()
                 except Exception as e:
                     print(f"Error downloading item: {e}")
                     ok = False
                     item_url = None
+                    filename = None
                 completed += 1
                 set_progress((completed / total_files) * 100)
                 if ok:
@@ -477,19 +494,23 @@ def download_from_bunkr(url, base_folder):
                         append_history(folder, item_url)
                 else:
                     failed += 1
-        set_button_state(download_button, "normal")
-        set_button_state(cancel_button, "disabled")
+                    if item_url:
+                        log_failure(folder, item_url, "Download Failed")
         if STOP_EVENT.is_set():
             set_status("Download cancelled")
             return
         set_status("Download completed!")
         update_stats(stats_text, f"Download completed.\nTotal Images: {images}\nTotal Videos: {videos}\nSuccessful: {successful}\nFailed: {failed}")
-        download_complete_callback()
     except Exception as e:
         print(f"Error downloading from Bunkr: {e}")
         set_status(f"Error: {str(e)}")
+        log_failure(folder, url, f"Exception: {e}")
+    finally:
         set_button_state(download_button, "normal")
         set_button_state(cancel_button, "disabled")
+        if STOP_EVENT.is_set():
+            set_status("Download cancelled")
+        download_complete_callback()
 
 def parse_gofile_content_id(url):
     parsed = urlparse(url)
@@ -616,113 +637,120 @@ def show_password_dialog():
     return result[0]
 
 def download_from_gofile(url, base_folder, status_label=None, progress_var=None):
-    token = get_gofile_token()
-    if not token:
-        set_status("Failed to get GoFile access token")
-        set_button_state(download_button, "normal")
-        set_button_state(cancel_button, "disabled")
-        return
-    content_id = parse_gofile_content_id(url)
-    if not content_id:
-        set_status("Invalid GoFile URL format")
-        set_button_state(download_button, "normal")
-        set_button_state(cancel_button, "disabled")
-        return
-    set_status("Collecting links from GoFile...")
-    data = get_gofile_content_data(content_id, token, None)
-    password = None
-    if not data:
-        set_status("No files found to download from GoFile")
-        set_button_state(download_button, "normal")
-        set_button_state(cancel_button, "disabled")
-        return
-    if "password" in data and data.get("passwordStatus") and data.get("passwordStatus") != "passwordOk":
-        password = show_password_dialog()
-        if not password:
-            set_status("Password required to continue")
-            set_button_state(download_button, "normal")
-            set_button_state(cancel_button, "disabled")
-            return
-        data = get_gofile_content_data(content_id, token, password)
-        if not data:
-            set_status("No files found to download from GoFile")
-            set_button_state(download_button, "normal")
-            set_button_state(cancel_button, "disabled")
-            return
-    root_name = clean_filename(data.get("name") or "GoFile")
-    file_links = recursive_extract_gofile_links(content_id, token, password, "", True)
-    if not file_links:
-        set_status("No files found to download from GoFile")
-        set_button_state(download_button, "normal")
-        set_button_state(cancel_button, "disabled")
-        return
     main_gofile_folder = os.path.join(base_folder, "GoFile")
     os.makedirs(main_gofile_folder, exist_ok=True)
-    if len(file_links) <= 2:
-        target_folder = main_gofile_folder
-    else:
-        target_folder = os.path.join(main_gofile_folder, root_name)
-        os.makedirs(target_folder, exist_ok=True)
-    history = load_history(target_folder)
-    total_files = len(file_links)
-    completed = 0
-    successful = 0
-    failed = 0
-    pending_links = []
-    for file_info in file_links:
-        file_url = file_info.get("url")
-        if file_url and file_url in history:
-            successful += 1
-            completed += 1
+    target_folder = main_gofile_folder
+    try:
+        token = get_gofile_token()
+        if not token:
+            set_status("Failed to get GoFile access token")
+            log_failure(main_gofile_folder, url, "Failed to get GoFile access token")
+            return
+        content_id = parse_gofile_content_id(url)
+        if not content_id:
+            set_status("Invalid GoFile URL format")
+            log_failure(main_gofile_folder, url, "Invalid GoFile URL format")
+            return
+        set_status("Collecting links from GoFile...")
+        data = get_gofile_content_data(content_id, token, None)
+        password = None
+        if not data:
+            set_status("No files found to download from GoFile")
+            log_failure(main_gofile_folder, url, "No files found")
+            return
+        if "password" in data and data.get("passwordStatus") and data.get("passwordStatus") != "passwordOk":
+            password = show_password_dialog()
+            if not password:
+                set_status("Password required to continue")
+                log_failure(main_gofile_folder, url, "Password required")
+                return
+            data = get_gofile_content_data(content_id, token, password)
+            if not data:
+                set_status("No files found to download from GoFile")
+                log_failure(main_gofile_folder, url, "No files found")
+                return
+        root_name = clean_filename(data.get("name") or "GoFile")
+        file_links = recursive_extract_gofile_links(content_id, token, password, "", True)
+        if not file_links:
+            set_status("No files found to download from GoFile")
+            log_failure(main_gofile_folder, url, "No files found")
+            return
+        if len(file_links) <= 2:
+            target_folder = main_gofile_folder
         else:
-            pending_links.append(file_info)
-    if total_files > 0 and completed:
-        set_progress((completed / total_files) * 100)
-    download_headers = {
-        "Cookie": f"accountToken={token}",
-        "Referer": "https://gofile.io/",
-        "Origin": "https://gofile.io"
-    }
-    def download_item(file_info):
-        file_url = file_info.get("url")
-        if STOP_EVENT.is_set():
-            return False, file_url
-        rel_path = file_info.get("rel_path") or ""
-        folder = target_folder
-        if rel_path and len(file_links) > 2:
-            folder = os.path.join(target_folder, rel_path)
-            os.makedirs(folder, exist_ok=True)
-        filename = clean_filename(file_info.get("name") or "file")
-        ok = smart_download(file_url, folder, filename, make_progress_callback(filename, update_progress=False), headers=download_headers)
-        return ok, file_url
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        futures = [executor.submit(download_item, file_info) for file_info in pending_links]
-        for future in concurrent.futures.as_completed(futures):
-            if STOP_EVENT.is_set():
-                break
-            ok = False
-            file_url = None
-            try:
-                ok, file_url = future.result()
-            except Exception as e:
-                print(f"Error downloading GoFile item: {e}")
-                ok = False
-            completed += 1
-            set_progress((completed / total_files) * 100)
-            if ok:
+            target_folder = os.path.join(main_gofile_folder, root_name)
+            os.makedirs(target_folder, exist_ok=True)
+        history = load_history(target_folder)
+        total_files = len(file_links)
+        completed = 0
+        successful = 0
+        failed = 0
+        pending_links = []
+        for file_info in file_links:
+            file_url = file_info.get("url")
+            if file_url and file_url in history:
                 successful += 1
-                if file_url:
-                    append_history(target_folder, file_url)
+                completed += 1
             else:
-                failed += 1
-    set_button_state(download_button, "normal")
-    set_button_state(cancel_button, "disabled")
-    if STOP_EVENT.is_set():
-        set_status("Download cancelled")
-        return
-    set_status("Download completed!")
-    update_stats(stats_text, f"Download completed.\nTotal Files: {total_files}\nSuccessful: {successful}\nFailed: {failed}")
-    download_complete_callback()
+                pending_links.append(file_info)
+        if total_files > 0 and completed:
+            set_progress((completed / total_files) * 100)
+        download_headers = {
+            "Cookie": f"accountToken={token}",
+            "Referer": "https://gofile.io/",
+            "Origin": "https://gofile.io"
+        }
+        def download_item(file_info):
+            file_url = file_info.get("url")
+            if STOP_EVENT.is_set():
+                return False, file_url, target_folder, None
+            rel_path = file_info.get("rel_path") or ""
+            folder = target_folder
+            if rel_path and len(file_links) > 2:
+                folder = os.path.join(target_folder, rel_path)
+                os.makedirs(folder, exist_ok=True)
+            filename = clean_filename(file_info.get("name") or "file")
+            ok = smart_download(file_url, folder, filename, make_progress_callback(filename, update_progress=False), headers=download_headers)
+            return ok, file_url, folder, filename
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = [executor.submit(download_item, file_info) for file_info in pending_links]
+            for future in concurrent.futures.as_completed(futures):
+                if STOP_EVENT.is_set():
+                    break
+                ok = False
+                file_url = None
+                folder = target_folder
+                filename = None
+                try:
+                    ok, file_url, folder, filename = future.result()
+                except Exception as e:
+                    print(f"Error downloading GoFile item: {e}")
+                    ok = False
+                completed += 1
+                set_progress((completed / total_files) * 100)
+                if ok:
+                    successful += 1
+                    if file_url:
+                        append_history(target_folder, file_url)
+                else:
+                    failed += 1
+                    if file_url:
+                        log_failure(folder, file_url, "Download Failed")
+        if STOP_EVENT.is_set():
+            set_status("Download cancelled")
+            return
+        set_status("Download completed!")
+        update_stats(stats_text, f"Download completed.\nTotal Files: {total_files}\nSuccessful: {successful}\nFailed: {failed}")
+    except Exception as e:
+        print(f"Error downloading from GoFile: {e}")
+        set_status(f"Error: {str(e)}")
+        log_failure(target_folder, url, f"Exception: {e}")
+    finally:
+        set_button_state(download_button, "normal")
+        set_button_state(cancel_button, "disabled")
+        if STOP_EVENT.is_set():
+            set_status("Download cancelled")
+        download_complete_callback()
 
 def extract_videzz_video(url, headers=None):
     if not headers:
@@ -774,28 +802,34 @@ def generate_random_filename(extension):
     return f"{random_name}.{extension}"
 
 def download_from_videzz(url, base_folder):
-    set_status("Extracting video from videzz.net...")
     vidoza_folder = os.path.join(base_folder, "Vidoza")
-    if not os.path.exists(vidoza_folder):
-        os.makedirs(vidoza_folder)
-    video_url = extract_videzz_video(url)
-    if not video_url:
-        set_status("Could not extract video URL")
+    os.makedirs(vidoza_folder, exist_ok=True)
+    try:
+        set_status("Extracting video from videzz.net...")
+        video_url = extract_videzz_video(url)
+        if not video_url:
+            set_status("Could not extract video URL")
+            log_failure(vidoza_folder, url, "Could not extract video URL")
+            return
+        original_extension = video_url.split("/")[-1].split(".")[-1]
+        random_filename = generate_random_filename(original_extension)
+        set_status(f"Downloading video to {random_filename}")
+        if smart_download(video_url, vidoza_folder, random_filename, make_progress_callback(random_filename)):
+            set_status("Video downloaded successfully")
+            update_stats(stats_text, f"Download completed.\nVideo: {random_filename}\nSaved to: Vidoza folder")
+        else:
+            set_status("Error downloading video")
+            log_failure(vidoza_folder, url, "Download Failed")
+    except Exception as e:
+        print(f"Error downloading from videzz.net: {e}")
+        set_status(f"Error: {str(e)}")
+        log_failure(vidoza_folder, url, f"Exception: {e}")
+    finally:
         set_button_state(download_button, "normal")
         set_button_state(cancel_button, "disabled")
+        if STOP_EVENT.is_set():
+            set_status("Download cancelled")
         download_complete_callback()
-        return
-    original_extension = video_url.split("/")[-1].split(".")[-1]
-    random_filename = generate_random_filename(original_extension)
-    set_status(f"Downloading video to {random_filename}")
-    if smart_download(video_url, vidoza_folder, random_filename, make_progress_callback(random_filename)):
-        set_status("Video downloaded successfully")
-        update_stats(stats_text, f"Download completed.\nVideo: {random_filename}\nSaved to: Vidoza folder")
-    else:
-        set_status("Error downloading video")
-    set_button_state(download_button, "normal")
-    set_button_state(cancel_button, "disabled")
-    download_complete_callback()
 
 def is_pixeldrain_url(url):
     parsed_url = urlparse(url)
@@ -877,15 +911,13 @@ def extract_pixeldrain_info(url):
         return None
 
 def download_from_pixeldrain(url, base_folder, status_label=None, progress_var=None):
+    pixeldrain_folder = os.path.join(base_folder, "Pixeldrain")
+    os.makedirs(pixeldrain_folder, exist_ok=True)
     try:
-        pixeldrain_folder = os.path.join(base_folder, "Pixeldrain")
-        if not os.path.exists(pixeldrain_folder):
-            os.makedirs(pixeldrain_folder)
         result = extract_pixeldrain_info(url)
         if not result:
             set_status("Could not extract information from PixelDrain URL")
-            set_button_state(download_button, "normal")
-            set_button_state(cancel_button, "disabled")
+            log_failure(pixeldrain_folder, url, "Could not extract information from PixelDrain URL")
             return
         if result["type"] == "album":
             album_folder = os.path.join(pixeldrain_folder, result["album_title"])
@@ -903,6 +935,7 @@ def download_from_pixeldrain(url, base_folder, status_label=None, progress_var=N
                     successful += 1
                 else:
                     failed += 1
+                    log_failure(album_folder, file_info["url"], "Download Failed")
                 set_progress((i / total_files) * 100)
             set_status("Download completed!")
             update_stats(stats_text, f"Download completed.\nTotal Files: {total_files}\nSuccessful: {successful}\nFailed: {failed}")
@@ -914,14 +947,17 @@ def download_from_pixeldrain(url, base_folder, status_label=None, progress_var=N
                 update_stats(stats_text, f"Download completed.\nFile: {result['file_name']}")
             else:
                 set_status("Error downloading file")
-        set_button_state(download_button, "normal")
-        set_button_state(cancel_button, "disabled")
-        download_complete_callback()
+                log_failure(pixeldrain_folder, result["file_url"], "Download Failed")
     except Exception as e:
         print(f"Error downloading from PixelDrain: {e}")
         set_status(f"Error: {str(e)}")
+        log_failure(pixeldrain_folder, url, f"Exception: {e}")
+    finally:
         set_button_state(download_button, "normal")
         set_button_state(cancel_button, "disabled")
+        if STOP_EVENT.is_set():
+            set_status("Download cancelled")
+        download_complete_callback()
 
 def is_streamtape_url(url):
     parsed_url = urlparse(url)
@@ -935,8 +971,9 @@ def download_chunk(video_url, start, end, chunk_num, headers):
     return chunk_num, response.content
 
 def download_from_streamtape(url, base_folder, status_label=None, progress_var=None, retry_count=0):
+    finalize = True
+    streamtape_folder = os.path.join(base_folder, "Streamtape")
     try:
-        streamtape_folder = os.path.join(base_folder, "Streamtape")
         if not os.path.exists(streamtape_folder):
             os.makedirs(streamtape_folder)
         headers = {
@@ -988,10 +1025,10 @@ def download_from_streamtape(url, base_folder, status_label=None, progress_var=N
             if retry_count < 1:
                 set_status("Could not extract video URL, retrying...")
                 time.sleep(2)
+                finalize = False
                 return download_from_streamtape(url, base_folder, status_label, progress_var, retry_count + 1)
             set_status("Could not extract video URL from Streamtape after retry")
-            set_button_state(download_button, "normal")
-            set_button_state(cancel_button, "disabled")
+            log_failure(streamtape_folder, url, "Could not extract video URL")
             return
         video_url = f"https://streamtape.com{video_url_part}&stream=1"
         title_meta = soup.find("meta", {"name": "og:title"})
@@ -1006,6 +1043,7 @@ def download_from_streamtape(url, base_folder, status_label=None, progress_var=N
             if retry_count < 1:
                 set_status("Could not determine video size, retrying...")
                 time.sleep(2)
+                finalize = False
                 return download_from_streamtape(url, base_folder, status_label, progress_var, retry_count + 1)
             set_status("Could not determine video size, falling back to single download")
             video_response = requests.get(video_url, headers=headers, stream=True)
@@ -1058,6 +1096,7 @@ def download_from_streamtape(url, base_folder, status_label=None, progress_var=N
             if retry_count < 1:
                 set_status(f"Error during download, retrying... ({str(e)})")
                 time.sleep(2)
+                finalize = False
                 return download_from_streamtape(url, base_folder, status_label, progress_var, retry_count + 1)
             raise e
         finally:
@@ -1066,18 +1105,22 @@ def download_from_streamtape(url, base_folder, status_label=None, progress_var=N
                     os.unlink(temp_file.name)
                 except Exception:
                     pass
-        set_button_state(download_button, "normal")
-        set_button_state(cancel_button, "disabled")
-        download_complete_callback()
     except Exception as e:
         if retry_count < 1:
             set_status(f"Error downloading from Streamtape, retrying... ({str(e)})")
             time.sleep(2)
+            finalize = False
             return download_from_streamtape(url, base_folder, status_label, progress_var, retry_count + 1)
         print(f"Error downloading from Streamtape: {e}")
         set_status(f"Error: {str(e)}")
-        set_button_state(download_button, "normal")
-        set_button_state(cancel_button, "disabled")
+        log_failure(streamtape_folder, url, f"Exception: {e}")
+    finally:
+        if finalize:
+            set_button_state(download_button, "normal")
+            set_button_state(cancel_button, "disabled")
+            if STOP_EVENT.is_set():
+                set_status("Download cancelled")
+            download_complete_callback()
 
 def sanitize_url(url):
     try:
@@ -1512,17 +1555,14 @@ def is_vtube_url(url):
     return any(domain in parsed_url.netloc for domain in SUPPORTED_SITES["vtube"])
 
 def download_from_vtube(url, base_folder, status_label=None, progress_var=None):
+    vtube_folder = os.path.join(base_folder, "vTube")
+    os.makedirs(vtube_folder, exist_ok=True)
     try:
-        vtube_folder = os.path.join(base_folder, "vTube")
-        if not os.path.exists(vtube_folder):
-            os.makedirs(vtube_folder)
         set_status("Extracting video from vtube.network...")
         m3u8_url = extract_video_url(url)
         if not m3u8_url:
             set_status("Could not extract video URL")
-            set_button_state(download_button, "normal")
-            set_button_state(cancel_button, "disabled")
-            download_complete_callback()
+            log_failure(vtube_folder, url, "Could not extract video URL")
             return
         output_filename = create_random_filename()
         output_path = os.path.join(vtube_folder, output_filename)
@@ -1530,9 +1570,7 @@ def download_from_vtube(url, base_folder, status_label=None, progress_var=None):
             subprocess.run(["ffmpeg", "-version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
         except (subprocess.SubprocessError, FileNotFoundError):
             set_status("FFmpeg not found. Please install FFmpeg and add it to PATH")
-            set_button_state(download_button, "normal")
-            set_button_state(cancel_button, "disabled")
-            download_complete_callback()
+            log_failure(vtube_folder, url, "FFmpeg not found")
             return
         set_status(f"Downloading: {output_filename}")
         command = [
@@ -1570,14 +1608,17 @@ def download_from_vtube(url, base_folder, status_label=None, progress_var=None):
             update_stats(stats_text, f"Download completed.\nVideo: {output_filename}")
         else:
             set_status("Error downloading video")
-        set_button_state(download_button, "normal")
-        set_button_state(cancel_button, "disabled")
-        download_complete_callback()
+            if not STOP_EVENT.is_set():
+                log_failure(vtube_folder, url, "Download Failed")
     except Exception as e:
         print(f"Error downloading from vtube.network: {e}")
         set_status(f"Error: {str(e)}")
+        log_failure(vtube_folder, url, f"Exception: {e}")
+    finally:
         set_button_state(download_button, "normal")
         set_button_state(cancel_button, "disabled")
+        if STOP_EVENT.is_set():
+            set_status("Download cancelled")
         download_complete_callback()
 
 def create_random_filename(prefix="video_", extension=".mp4"):
@@ -1685,17 +1726,14 @@ def fetch_rubyvid_html(url):
         return None
 
 def download_from_rubyvid(url, base_folder, status_label=None, progress_var=None):
+    rubyvid_folder = os.path.join(base_folder, "RubyVid")
+    os.makedirs(rubyvid_folder, exist_ok=True)
     try:
-        rubyvid_folder = os.path.join(base_folder, "RubyVid")
-        if not os.path.exists(rubyvid_folder):
-            os.makedirs(rubyvid_folder)
         set_status("Extracting video from rubyvid.com...")
         html = fetch_rubyvid_html(url)
         if not html:
             set_status("Could not fetch RubyVid page")
-            set_button_state(download_button, "normal")
-            set_button_state(cancel_button, "disabled")
-            download_complete_callback()
+            log_failure(rubyvid_folder, url, "Could not fetch RubyVid page")
             return
         m3u8_urls = extract_rubyvid_m3u8(html)
         if not m3u8_urls:
@@ -1704,9 +1742,7 @@ def download_from_rubyvid(url, base_folder, status_label=None, progress_var=None
                 m3u8_urls = [re.sub(r"([/_])([a-z,]*h[a-z,]*)[,.]", r"\1h.", url) for url in m3u8_urls]
         if not m3u8_urls:
             set_status("Could not extract video URL")
-            set_button_state(download_button, "normal")
-            set_button_state(cancel_button, "disabled")
-            download_complete_callback()
+            log_failure(rubyvid_folder, url, "Could not extract video URL")
             return
         m3u8_url = m3u8_urls[0]
         output_filename = create_random_filename()
@@ -1715,8 +1751,7 @@ def download_from_rubyvid(url, base_folder, status_label=None, progress_var=None
             subprocess.run(["ffmpeg", "-version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
         except (subprocess.SubprocessError, FileNotFoundError):
             set_status("FFmpeg not found. Please install FFmpeg and add it to PATH")
-            set_button_state(download_button, "normal")
-            set_button_state(cancel_button, "disabled")
+            log_failure(rubyvid_folder, url, "FFmpeg not found")
             return
         set_status(f"Downloading: {output_filename}")
         command = [
@@ -1754,14 +1789,17 @@ def download_from_rubyvid(url, base_folder, status_label=None, progress_var=None
             update_stats(stats_text, f"Download completed.\nVideo: {output_filename}")
         else:
             set_status("Error downloading video")
-        set_button_state(download_button, "normal")
-        set_button_state(cancel_button, "disabled")
-        download_complete_callback()
+            if not STOP_EVENT.is_set():
+                log_failure(rubyvid_folder, url, "Download Failed")
     except Exception as e:
         print(f"Error downloading from rubyvid.com: {e}")
         set_status(f"Error: {str(e)}")
+        log_failure(rubyvid_folder, url, f"Exception: {e}")
+    finally:
         set_button_state(download_button, "normal")
         set_button_state(cancel_button, "disabled")
+        if STOP_EVENT.is_set():
+            set_status("Download cancelled")
         download_complete_callback()
 
 if __name__ == "__main__":
