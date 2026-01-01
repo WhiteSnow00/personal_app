@@ -1098,6 +1098,19 @@ def start_download_thread():
     download_thread.daemon = True
     download_thread.start()
 
+def on_start_button_click():
+    STOP_EVENT.clear()
+
+    if download_queue:
+        if not is_downloading:
+            if not folder_entry.get().strip():
+                show_error("Error", "Please select a main folder.")
+                return
+            process_download_queue()
+        return
+
+    start_download_thread()
+
 def cancel_download_process():
     STOP_EVENT.set()
     set_status("Download cancelled")
@@ -1151,10 +1164,6 @@ def download_complete_callback():
 
 def start_download():
     STOP_EVENT.clear()
-    if download_queue:
-        if not is_downloading:
-            process_download_queue()
-        return
     url = sanitize_url(url_entry.get())
     if not url:
         show_error("Error", "Please enter a URL.")
@@ -1375,7 +1384,7 @@ def create_gui():
     download_button = ttk.Button(
         button_frame,
         text="Start Download",
-        command=start_download_thread,
+        command=on_start_button_click,
         style="Accent.TButton",
         width=25
     )
