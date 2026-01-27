@@ -23,6 +23,18 @@ TRASH_LOW_RES_DIRNAME = "_TRASH_LOW_RES"
 GROUP_DIR_PREFIX = "Group_"
 CACHE_DB_FILENAME = "video_cache.sqlite3"
 
+class Thresholds:
+
+    MIN_RESOLUTION_PX: int = 480
+    PHASH_BITS: int = 64
+    DURATION_TOLERANCE_S: float = 0.1
+    MTIME_TOLERANCE_S: float = 2.0 
+    PROGRESS_INTERVAL: int = 25
+    COARSE_STEP: int = 5
+    COARSE_THRESHOLD: int = 200
+    DURATION_PADDING_S: int = 60
+    FRAME_SIZE: int = 32
+
 try:
     import imagehash
 except Exception:
@@ -67,7 +79,6 @@ class FFmpegLocator:
             f"Expected `{ffmpeg_name}` and `{ffprobe_name}` in one of:\n{candidates}"
         )
 
-
 class VideoScanner:
     def __init__(self, on_log: Callable[[str], None] = _noop):
         self._on_log = on_log
@@ -99,13 +110,11 @@ class VideoScanner:
         self._on_log(f"[INFO] Found {len(video_paths)} video(s) under {root_path}.")
         return video_paths
 
-
 @dataclass(frozen=True, slots=True)
 class VideoMetadata:
     duration_s: float
     width: int
     height: int
-
 
 class FFprobeValidator:
     def __init__(self, ffprobe_path: str, timeout_s: int = 30):
@@ -141,17 +150,20 @@ class FFprobeValidator:
             )
         except subprocess.TimeoutExpired:
             return None, "ffprobe timeout."
+        except subprocess.SubprocessError as exc:
+            return None, f"ffprobe subprocess error: {exc}"
+        except OSError as exc:
+            return None, f"File access error: {exc}"
         except Exception as exc:
-            return None, f"ffprobe failed: {exc}"
+            return None, f"Unexpected error: {type(exc).__name__}: {exc}"
 
         if proc.returncode != 0:
             err = (proc.stderr or "").strip()
             return None, err or f"ffprobe return code {proc.returncode}"
-
         try:
             payload = json.loads(proc.stdout or "{}")
-        except json.JSONDecodeError:
-            return None, "ffprobe produced invalid JSON."
+        except json.JSONDecodeError as exc:
+            return None, f"Invalid ffprobe JSON output: {exc}"
 
         streams = payload.get("streams") or []
         if not streams:
@@ -174,15 +186,13 @@ class FFprobeValidator:
 
         return VideoMetadata(duration_s=duration_s, width=width, height=height), None
 
-
 @dataclass(frozen=True, slots=True)
 class FingerprintConfig:
     sample_fps: float = 1.0
-    frame_size: int = 32
+    frame_size: int = Thresholds.FRAME_SIZE
     max_frames: int = 1800
     ffmpeg_timeout_s: int = 0
     ffprobe_timeout_s: int = 30
-
 
 @dataclass(frozen=True, slots=True)
 class MatchConfig:
@@ -191,13 +201,11 @@ class MatchConfig:
     max_offset_s: int = 600
     min_overlap_frames: int = 10
 
-
 @dataclass(frozen=True, slots=True)
 class EngineConfig:
     fingerprint: FingerprintConfig = FingerprintConfig()
     match: MatchConfig = MatchConfig()
     max_threads: int = 3
-
 
 @dataclass(frozen=True, slots=True)
 class VideoFingerprint:
@@ -207,7 +215,6 @@ class VideoFingerprint:
     consensus_hash: int
     file_size: int
 
-
 @dataclass(frozen=True, slots=True)
 class EngineCallbacks:
     log: Callable[[str], None] = _noop
@@ -215,7 +222,6 @@ class EngineCallbacks:
     stage: Callable[[str], None] = _noop
     result: Callable[[dict], None] = _noop
     should_cancel: Callable[[], bool] = lambda: False
-
 
 class DedupDatabase:
     def __init__(self, db_path: str | Path, *, commit_every: int = 10):
@@ -268,7 +274,7 @@ class DedupDatabase:
         row_mtime = float(row["mtime"] or -1.0)
         if row_size != int(file_size):
             return None
-        if not (abs(row_mtime - float(mtime)) < 2.0):
+        if not (abs(row_mtime - float(mtime)) < Thresholds.MTIME_TOLERANCE_S):
             return None
 
         blob = row["phash_data"]
@@ -346,6 +352,31 @@ class DedupDatabase:
             except Exception:
                 pass
 
+    def cleanup_stale_entries(self, valid_paths: set[str]) -> int:
+
+        if not valid_paths:
+            return 0
+
+        with self._lock:
+            try:
+                cursor = self._conn.execute("SELECT path FROM video_cache")
+                cached_paths = {row[0] for row in cursor.fetchall()}
+            except sqlite3.Error:
+                return 0
+
+            stale_paths = cached_paths - valid_paths
+            if not stale_paths:
+                return 0
+
+            for path in stale_paths:
+                try:
+                    self._conn.execute("DELETE FROM video_cache WHERE path = ?", (path,))
+                except sqlite3.Error:
+                    continue
+
+            self._conn.commit()
+            self._pending_writes = 0
+            return len(stale_paths)
 
 class BKTree:
     class _Node:
@@ -400,25 +431,22 @@ class BKTree:
 
         return results
 
-
 def _dct_matrix_1d(n: int) -> np.ndarray:
     indices = np.arange(n, dtype=np.float32)
     k_values = np.arange(n, dtype=np.float32)[:, None]
     matrix = np.cos((indices + 0.5) * k_values * (np.pi / n))
     matrix[0, :] *= 1.0 / np.sqrt(n)
-    matrix[1:, :] *= np.sqrt(2.0 / n)
+    matrix[1:, :] *= np.sqrt(2 / n)
     return matrix
 
-
-_DCT32 = _dct_matrix_1d(32)
-
+_DCT32 = _dct_matrix_1d(Thresholds.FRAME_SIZE)
 
 _USE_IMAGEHASH = os.environ.get("VIDEO_DEDUP_USE_IMAGEHASH", "").strip() in {"1", "true", "yes", "on"}
 
-
 def phash_uint64_from_gray_32x32(gray: np.ndarray) -> int:
-    if gray.shape != (32, 32):
-        raise ValueError(f"Expected (32, 32), got {gray.shape}")
+    expected_shape = (Thresholds.FRAME_SIZE, Thresholds.FRAME_SIZE)
+    if gray.shape != expected_shape:
+        raise ValueError(f"Expected {expected_shape}, got {gray.shape}")
     if _USE_IMAGEHASH and imagehash is not None:
         from PIL import Image
 
@@ -433,7 +461,6 @@ def phash_uint64_from_gray_32x32(gray: np.ndarray) -> int:
     packed = np.packbits(bits, bitorder="little")
     return int.from_bytes(packed.tobytes(), byteorder="little", signed=False)
 
-
 def consensus_hash_uint64(hashes: np.ndarray) -> int:
     if hashes.size == 0:
         return 0
@@ -444,19 +471,15 @@ def consensus_hash_uint64(hashes: np.ndarray) -> int:
     packed = np.packbits(consensus_bits, bitorder="little")
     return int.from_bytes(packed.tobytes(), byteorder="little", signed=False)
 
-
 def hamming_distance_uint64_scalar(a: int, b: int) -> int:
     return int(a ^ b).bit_count()
-
 
 def bitwise_count_uint64(arr: np.ndarray) -> np.ndarray:
     xor_view = arr.astype(np.uint64, copy=False)
     if hasattr(np, "bitwise_count"):
         return np.bitwise_count(xor_view)
-
     bytes_view = xor_view.view(np.uint8).reshape(-1, 8)
     return _POPCOUNT_LUT[bytes_view].sum(axis=1).astype(np.uint8)
-
 
 def best_time_shift_similarity(
     hashes_a: np.ndarray,
@@ -464,7 +487,9 @@ def best_time_shift_similarity(
     *,
     max_offset_frames: int,
     min_overlap_frames: int,
+    early_exit_threshold: float = 0.0,
 ) -> tuple[float, int, int]:
+
     if hashes_a.size == 0 or hashes_b.size == 0:
         return 0.0, 0, 0
 
@@ -484,8 +509,8 @@ def best_time_shift_similarity(
 
     offset_span = high - low
     coarse_step = 1
-    if offset_span > 200:
-        coarse_step = 5
+    if offset_span > Thresholds.COARSE_THRESHOLD:
+        coarse_step = Thresholds.COARSE_STEP
 
     def eval_offset(offset_frames: int) -> tuple[float, int]:
         a_start = max(0, -offset_frames)
@@ -496,29 +521,34 @@ def best_time_shift_similarity(
         a_seg = a[a_start : a_start + overlap]
         b_seg = b[b_start : b_start + overlap]
         mean_dist = float(bitwise_count_uint64(np.bitwise_xor(a_seg, b_seg)).mean())
-        return 1.0 - (mean_dist / 64.0), overlap
+        return 1.0 - (mean_dist / float(Thresholds.PHASH_BITS)), overlap
 
+    top_candidates: list[tuple[float, int, int]] = []
     for offset_frames in range(low, high + 1, coarse_step):
-        a_start = max(0, -offset_frames)
-        b_start = max(0, offset_frames)
-        overlap = min(len_a - a_start, len_b - b_start)
+        similarity, overlap = eval_offset(offset_frames)
         if overlap < min_overlap_frames:
             continue
-
-        a_seg = a[a_start : a_start + overlap]
-        b_seg = b[b_start : b_start + overlap]
-        mean_dist = float(bitwise_count_uint64(np.bitwise_xor(a_seg, b_seg)).mean())
-        similarity = 1.0 - (mean_dist / 64.0)
 
         if similarity > best_similarity:
             best_similarity = similarity
             best_offset = offset_frames
             best_overlap = overlap
+            if early_exit_threshold > 0 and best_similarity >= early_exit_threshold:
+                return best_similarity, best_offset, best_overlap
 
-    if coarse_step > 1 and best_overlap > 0:
-        refine_low = max(low, best_offset - coarse_step)
-        refine_high = min(high, best_offset + coarse_step)
-        for offset_frames in range(refine_low, refine_high + 1):
+        if coarse_step > 1:
+            top_candidates.append((similarity, offset_frames, overlap))
+            top_candidates.sort(reverse=True, key=lambda x: x[0])
+            del top_candidates[3:]
+
+    if coarse_step > 1 and top_candidates:
+        refined_offsets: set[int] = set()
+        for _sim, candidate_offset, _overlap in top_candidates:
+            for off in range(candidate_offset - coarse_step, candidate_offset + coarse_step + 1):
+                if low <= off <= high:
+                    refined_offsets.add(off)
+
+        for offset_frames in sorted(refined_offsets):
             similarity, overlap = eval_offset(offset_frames)
             if overlap < min_overlap_frames:
                 continue
@@ -526,9 +556,10 @@ def best_time_shift_similarity(
                 best_similarity = similarity
                 best_offset = offset_frames
                 best_overlap = overlap
+                if early_exit_threshold > 0 and best_similarity >= early_exit_threshold:
+                    return best_similarity, best_offset, best_overlap
 
     return best_similarity, best_offset, best_overlap
-
 
 def _fingerprint_video_worker(
     video_path: str,
@@ -603,9 +634,9 @@ def _fingerprint_video_worker(
         return {"path": path_str, "ok": False, "error": err or "Invalid video."}
 
     frame_size = int(fingerprint_config.frame_size)
-    if frame_size != 32:
-        on_log(f"[DONE] Finished: {video_name} (skipped: frame_size must be 32)")
-        return {"path": path_str, "ok": False, "error": "frame_size must be 32."}
+    if frame_size != Thresholds.FRAME_SIZE:
+        on_log(f"[DONE] Finished: {video_name} (skipped: frame_size must be {Thresholds.FRAME_SIZE})")
+        return {"path": path_str, "ok": False, "error": f"frame_size must be {Thresholds.FRAME_SIZE}."}
     bytes_per_frame = frame_size * frame_size
 
     sample_fps = float(fingerprint_config.sample_fps)
@@ -638,7 +669,6 @@ def _fingerprint_video_worker(
         "gray",
         "-",
     ]
-
     creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
     proc: subprocess.Popen[bytes] | None = None
     hashes: list[int] = []
@@ -757,7 +787,6 @@ def _fingerprint_video_worker(
         "cached": False,
     }
 
-
 class VideoDedupEngine:
     def __init__(
         self,
@@ -874,13 +903,13 @@ class VideoDedupEngine:
                 progress(int((idx / total) * 100))
                 continue
 
-            if min(int(meta.width), int(meta.height)) < 480:
+            if min(int(meta.width), int(meta.height)) < Thresholds.MIN_RESOLUTION_PX:
                 try:
                     trash_dir = root_path / TRASH_LOW_RES_DIRNAME
                     moved_to = self._safe_move_to_dir(p, trash_dir, collision="timestamp")
                     trashed_low_res += 1
                     log(
-                        f"[WARN] {_timestamp()} Cleanup moved low-res (<480p) to {TRASH_LOW_RES_DIRNAME}: "
+                        f"[WARN] {_timestamp()} Cleanup moved low-res (<{Thresholds.MIN_RESOLUTION_PX}px) to {TRASH_LOW_RES_DIRNAME}: "
                         f"{moved_to.name} ({int(meta.width)}x{int(meta.height)})"
                     )
                 except Exception as exc:
@@ -985,7 +1014,7 @@ class VideoDedupEngine:
             return {"processed": 0, "groups_created": 0, "files_moved": 0, "trashed_low_res": trashed_low_res, "cancelled": False}
 
         duration_items.sort(key=lambda t: t[0])
-        tolerance = 0.1
+        tolerance = Thresholds.DURATION_TOLERANCE_S
 
         clusters: list[list[tuple[float, Path]]] = []
         for item in duration_items:
@@ -1076,6 +1105,9 @@ class VideoDedupEngine:
                 return {"processed": 0, "duplicates": 0, "cancelled": False}
 
             db = DedupDatabase(root_path / CACHE_DB_FILENAME)
+            stale_count = db.cleanup_stale_entries({str(p) for p in video_paths})
+            if stale_count > 0:
+                log(f"[INFO] {_timestamp()} Removed {stale_count} stale cache entries.")
             cancel_event = threading.Event()
 
             fp_config = self._config.fingerprint
@@ -1116,7 +1148,6 @@ class VideoDedupEngine:
                 for _ in range(max_threads):
                     if not submit_next(executor):
                         break
-
                 while pending:
                     if should_cancel() and not cancelling:
                         cancelling = True
@@ -1167,8 +1198,8 @@ class VideoDedupEngine:
                 return {"processed": 0, "duplicates": 0, "cancelled": False}
 
             stage("Indexing/Comparing")
-            max_hamming = int(round((1.0 - float(match_config.consensus_prefilter_similarity)) * 64.0))
-            max_hamming = max(0, min(64, max_hamming))
+            max_hamming = int(round((1.0 - float(match_config.consensus_prefilter_similarity)) * float(Thresholds.PHASH_BITS)))
+            max_hamming = max(0, min(Thresholds.PHASH_BITS, max_hamming))
             log(f"[INFO] {_timestamp()} Phase 3: BK-Tree prefilter <= {max_hamming} bit(s)")
             log(f"[INFO] {_timestamp()} Phase 3: Streaming BK-Tree compare...")
             progress(0)
@@ -1188,7 +1219,7 @@ class VideoDedupEngine:
                         break
 
                     other = fingerprints[j]
-                    if abs(fp.duration_s - other.duration_s) > (match_config.max_offset_s + 60):
+                    if abs(fp.duration_s - other.duration_s) > (match_config.max_offset_s + Thresholds.DURATION_PADDING_S):
                         continue
 
                     comparisons_run += 1
@@ -1197,6 +1228,7 @@ class VideoDedupEngine:
                         fp.hashes,
                         max_offset_frames=max_offset_frames,
                         min_overlap_frames=min_overlap,
+                        early_exit_threshold=float(match_config.duplicate_similarity),
                     )
 
                     if similarity >= match_config.duplicate_similarity:
@@ -1214,15 +1246,12 @@ class VideoDedupEngine:
 
                 if cancelling:
                     break
-
                 tree.add(fp.consensus_hash, i)
-                if i % 25 == 0 or i == len(fingerprints) - 1:
+                if i % Thresholds.PROGRESS_INTERVAL == 0 or i == len(fingerprints) - 1:
                     progress(int(((i + 1) / len(fingerprints)) * 100))
-
             if cancelling:
                 log(f"[INFO] {_timestamp()} Cancelled.")
                 return {"processed": len(fingerprints), "duplicates": duplicates_found, "cancelled": True}
-
             progress(100)
             log(
                 f"[INFO] {_timestamp()} Done. Processed {len(fingerprints)} valid video(s). "
@@ -1242,7 +1271,6 @@ class VideoDedupEngine:
 
     def run(self, root_dir: str | Path) -> dict:
         return self.run_phase_3_content(root_dir)
-
 
 def run_gui(binaries: FFmpegBinaries) -> int:
     from PyQt5.QtCore import QThread, QTimer, Qt, pyqtSignal
@@ -1322,7 +1350,9 @@ def run_gui(binaries: FFmpegBinaries) -> int:
             elif self._task == "phase3_prepare":
                 summary = engine.run_phase_3_prepare(self._root_dir)
             elif self._task == "phase3_direct":
-                self._log("[INFO] Checkbox enabled: Running pre-scan cleanup for <480p videos...")
+                self._log(
+                    f"[INFO] Checkbox enabled: Running pre-scan cleanup for <{Thresholds.MIN_RESOLUTION_PX}px videos..."
+                )
                 cleanup = engine.run_cleanup_low_res(Path(self._root_dir))
                 if cleanup.get("cancelled"):
                     summary = {"cancelled": True, "error": "Cancelled during cleanup.", **cleanup}
@@ -1606,7 +1636,7 @@ def run_gui(binaries: FFmpegBinaries) -> int:
                 return
             try:
                 if os.name == "nt":
-                    os.startfile(str(p))  # type: ignore[attr-defined]
+                    os.startfile(str(p))  
                 else:
                     QDesktopServices.openUrl(QUrl.fromLocalFile(str(p)))
             except Exception as exc:
@@ -1649,7 +1679,7 @@ def run_gui(binaries: FFmpegBinaries) -> int:
 
             msg = f"Are you sure you want to delete this file?\n\n{path_str}"
             try:
-                from send2trash import send2trash as _send2trash  # type: ignore
+                from send2trash import send2trash as _send2trash  
 
                 send2trash_available = True
             except Exception:
@@ -1834,7 +1864,6 @@ def run_gui(binaries: FFmpegBinaries) -> int:
     window.show()
     return app.exec_()
 
-
 def main() -> int:
     try:
         binaries = FFmpegLocator.locate_or_raise()
@@ -1851,7 +1880,6 @@ def main() -> int:
         return 1
 
     return run_gui(binaries)
-
 
 if __name__ == "__main__":
     raise SystemExit(main())
