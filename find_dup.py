@@ -249,11 +249,53 @@ class DedupDatabase:
                     mtime REAL,
                     duration REAL,
                     phash_data BLOB,
-                    consensus_hash INTEGER
+                    consensus_hash TEXT
                 );
                 """
             )
             self._conn.commit()
+
+    @staticmethod
+    def _consensus_to_db(consensus_hash: int) -> str:
+        masked = int(consensus_hash) & ((1 << Thresholds.PHASH_BITS) - 1)
+        return hex(masked)
+
+    @staticmethod
+    def _consensus_from_db(value: object) -> Optional[int]:
+        if value is None:
+            return None
+
+        if isinstance(value, (int, np.integer)):
+            v = int(value)
+            if v < 0:
+                v &= ((1 << Thresholds.PHASH_BITS) - 1)
+            return v
+
+        if isinstance(value, memoryview):
+            value = value.tobytes()
+
+        if isinstance(value, (bytes, bytearray)):
+            try:
+                value = value.decode("utf-8")
+            except Exception:
+                return None
+
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+            try:
+                return int(text, 16)
+            except ValueError:
+                try:
+                    v = int(text)
+                except ValueError:
+                    return None
+                if v < 0:
+                    v &= ((1 << Thresholds.PHASH_BITS) - 1)
+                return v
+
+        return None
 
     def get_fingerprint(
         self, path: str, file_size: int, mtime: float
@@ -300,7 +342,15 @@ class DedupDatabase:
                 pass
             return None
 
-        return float(duration), hashes.astype(np.uint64, copy=False), int(consensus)
+        consensus_int = self._consensus_from_db(consensus)
+        if consensus_int is None:
+            try:
+                self.delete(path)
+            except Exception:
+                pass
+            return None
+
+        return float(duration), hashes.astype(np.uint64, copy=False), int(consensus_int)
 
     def upsert_fingerprint(
         self,
@@ -313,6 +363,7 @@ class DedupDatabase:
         consensus_hash: int,
     ) -> None:
         blob = sqlite3.Binary(pickle.dumps(hashes, protocol=pickle.HIGHEST_PROTOCOL))
+        consensus_hex = self._consensus_to_db(consensus_hash)
         with self._lock:
             self._conn.execute(
                 """
@@ -325,7 +376,7 @@ class DedupDatabase:
                     phash_data=excluded.phash_data,
                     consensus_hash=excluded.consensus_hash
                 """,
-                (path, int(file_size), float(mtime), float(duration), blob, int(consensus_hash)),
+                (path, int(file_size), float(mtime), float(duration), blob, consensus_hex),
             )
             self._pending_writes += 1
             if self._pending_writes >= self._commit_every:
