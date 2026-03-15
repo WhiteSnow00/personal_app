@@ -1,5 +1,6 @@
 from __future__ import annotations
 import json
+import hashlib
 import math
 import os
 import pickle
@@ -10,6 +11,7 @@ import sys
 import threading
 import time
 import traceback
+import unicodedata
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,6 +24,7 @@ VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".avi", ".webm"}
 TRASH_LOW_RES_DIRNAME = "_TRASH_LOW_RES"
 GROUP_DIR_PREFIX = "Group_"
 CACHE_DB_FILENAME = "video_cache.sqlite3"
+FAST_SIG_CHUNK_BYTES = 64 * 1024
 
 class Thresholds:
 
@@ -43,8 +46,242 @@ except Exception:
 def _timestamp() -> str:
     return time.strftime("%H:%M:%S")
 
+
 def _noop(*_args, **_kwargs) -> None:
     return None
+
+def _safe_resolve_path(path: str | Path, *, strict: bool = False) -> Path:
+    path_obj = Path(path).expanduser()
+    try:
+        return path_obj.resolve(strict=strict)
+    except TypeError:
+        pass
+    except Exception:
+        pass
+    try:
+        return Path(os.path.abspath(str(path_obj)))
+    except Exception:
+        return path_obj
+
+def _safe_exists(path: str | Path) -> bool:
+    try:
+        return Path(path).exists()
+    except OSError:
+        return False
+
+def _safe_is_file(path: str | Path) -> bool:
+    try:
+        return Path(path).is_file()
+    except OSError:
+        return False
+
+def _normalized_text(value: str) -> str:
+    return unicodedata.normalize("NFC", value)
+
+def _path_sort_key(path: Path) -> str:
+    return _normalized_text(str(path)).casefold()
+
+def _make_cache_identity(root_dir: str | Path, video_path: str | Path) -> tuple[str, str]:
+    root_path = _safe_resolve_path(root_dir, strict=False)
+    target_path = _safe_resolve_path(video_path, strict=False)
+    try:
+        rel_path = target_path.relative_to(root_path)
+        rel_text = _normalized_text(rel_path.as_posix())
+        return rel_text, rel_text
+    except Exception:
+        abs_text = _normalized_text(target_path.as_posix())
+        return f"ABS::{abs_text}", abs_text
+
+def _fast_file_signature(
+    path: str | Path,
+    file_size: int,
+    *,
+    chunk_size: int = FAST_SIG_CHUNK_BYTES,
+) -> Optional[str]:
+    if file_size < 0:
+        return None
+
+    file_path = Path(path)
+    hasher = hashlib.blake2b(digest_size=16)
+    hasher.update(int(file_size).to_bytes(8, byteorder="little", signed=False))
+
+    positions = [0]
+    if file_size > chunk_size:
+        tail = max(0, file_size - chunk_size)
+        if tail not in positions:
+            positions.append(tail)
+    if file_size > (chunk_size * 2):
+        middle = max(0, (file_size // 2) - (chunk_size // 2))
+        if middle not in positions:
+            positions.append(middle)
+
+    try:
+        with file_path.open("rb", buffering=0) as handle:
+            for position in positions:
+                handle.seek(position)
+                chunk = handle.read(chunk_size)
+                hasher.update(int(position).to_bytes(8, byteorder="little", signed=False))
+                hasher.update(chunk)
+    except OSError:
+        return None
+
+    return hasher.hexdigest()
+
+def _launch_detached(args: list[str]) -> bool:
+    kwargs = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+    }
+    if os.name == "nt":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    else:
+        kwargs["start_new_session"] = True
+
+    try:
+        subprocess.Popen(args, **kwargs)
+        return True
+    except OSError:
+        return False
+
+def _run_quiet(args: list[str], *, timeout_s: int = 5) -> bool:
+    kwargs = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "timeout": timeout_s,
+    }
+    if os.name == "nt":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+    try:
+        proc = subprocess.run(args, **kwargs)
+        return proc.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+def reveal_in_file_manager(path: str | Path) -> tuple[bool, str]:
+    target = _safe_resolve_path(path, strict=False)
+    if not _safe_exists(target):
+        return False, f"Path does not exist: {target}"
+
+    try:
+        is_file = target.is_file()
+    except OSError as exc:
+        return False, f"Path is inaccessible: {exc}"
+
+    if os.name == "nt":
+        explorer_target = os.path.normpath(str(target))
+        args = ["explorer.exe"]
+        if is_file:
+            # Explorer parses switches as comma-delimited fields; keep /select, separate from the path.
+            args.extend(["/select,", explorer_target])
+        else:
+            args.append(explorer_target)
+        return (_launch_detached(args), "Windows Explorer")
+
+    if sys.platform == "darwin":
+        if is_file:
+            return (_launch_detached(["open", "-R", str(target)]), "Finder")
+        return (_launch_detached(["open", str(target)]), "Finder")
+
+    if is_file:
+        uri = target.as_uri()
+        if shutil.which("gdbus") and _run_quiet(
+            [
+                "gdbus",
+                "call",
+                "--session",
+                "--dest",
+                "org.freedesktop.FileManager1",
+                "--object-path",
+                "/org/freedesktop/FileManager1",
+                "--method",
+                "org.freedesktop.FileManager1.ShowItems",
+                f"['{uri}']",
+                "",
+            ]
+        ):
+            return True, "org.freedesktop.FileManager1"
+
+        if shutil.which("dbus-send") and _run_quiet(
+            [
+                "dbus-send",
+                "--session",
+                "--print-reply=literal",
+                "--dest=org.freedesktop.FileManager1",
+                "--type=method_call",
+                "/org/freedesktop/FileManager1",
+                "org.freedesktop.FileManager1.ShowItems",
+                f"array:string:{uri}",
+                "string:",
+            ]
+        ):
+            return True, "org.freedesktop.FileManager1"
+
+        file_manager_commands: list[list[str]] = []
+        if shutil.which("nautilus"):
+            file_manager_commands.append(["nautilus", "--new-window", "--select", str(target)])
+        if shutil.which("dolphin"):
+            file_manager_commands.append(["dolphin", "--new-window", "--select", str(target)])
+        if shutil.which("thunar"):
+            # Thunar selects file URIs/paths when invoked with a file argument.
+            file_manager_commands.append(["thunar", str(target)])
+
+        for command in file_manager_commands:
+            if _launch_detached(command):
+                return True, Path(command[0]).name
+
+    open_target = target.parent if is_file else target
+    for command in (["xdg-open", str(open_target)], ["gio", "open", str(open_target)]):
+        if shutil.which(command[0]) and _launch_detached(command):
+            return True, command[0]
+
+    return False, "No supported file-manager reveal mechanism found."
+
+def _effective_duplicate_similarity(base_threshold: float, overlap_frames: int) -> float:
+    if overlap_frames <= 0:
+        return 1.0
+    if overlap_frames < 3:
+        return max(base_threshold, 0.995)
+    if overlap_frames < 5:
+        return max(base_threshold, 0.97)
+    if overlap_frames < 10:
+        return max(base_threshold, 0.92)
+    return base_threshold
+
+def _is_better_alignment(
+    similarity: float,
+    overlap_frames: int,
+    offset_frames: int,
+    best_similarity: float,
+    best_overlap_frames: int,
+    best_offset_frames: int,
+) -> bool:
+    epsilon = 1e-12
+    if similarity > (best_similarity + epsilon):
+        return True
+    if abs(similarity - best_similarity) > epsilon:
+        return False
+    if overlap_frames > best_overlap_frames:
+        return True
+    if overlap_frames < best_overlap_frames:
+        return False
+    if abs(offset_frames) < abs(best_offset_frames):
+        return True
+    if abs(offset_frames) > abs(best_offset_frames):
+        return False
+    return offset_frames < best_offset_frames
+
+def _prefilter_hamming_radius(base_similarity: float, frame_count: int) -> int:
+    radius = int(round((1.0 - float(base_similarity)) * float(Thresholds.PHASH_BITS)))
+    radius = max(0, min(Thresholds.PHASH_BITS, radius))
+    # A whole-video consensus hash is only a loose gate, so keep the radius conservative.
+    radius = max(radius, 20)
+    if frame_count < 30:
+        radius = min(Thresholds.PHASH_BITS, radius + 4)
+    return radius
+
 
 @dataclass(frozen=True, slots=True)
 class FFmpegBinaries:
@@ -54,13 +291,21 @@ class FFmpegBinaries:
 class FFmpegLocator:
     @staticmethod
     def _candidate_dirs() -> list[Path]:
-        cwd = Path(os.getcwd()).resolve()
-        script_dir = Path(__file__).resolve().parent
+        cwd = _safe_resolve_path(os.getcwd(), strict=False)
+        script_dir = _safe_resolve_path(Path(__file__).parent, strict=False)
         return [cwd, cwd / "bin", script_dir, script_dir / "bin"]
 
     @staticmethod
     def _binary_name(stem: str) -> str:
         return f"{stem}.exe" if os.name == "nt" else stem
+
+    @staticmethod
+    def _is_usable_binary(path: Path) -> bool:
+        if not path.is_file():
+            return False
+        if os.name == "nt":
+            return True
+        return os.access(str(path), os.X_OK)
 
     @classmethod
     def locate_or_raise(cls) -> FFmpegBinaries:
@@ -70,13 +315,19 @@ class FFmpegLocator:
         for base_dir in cls._candidate_dirs():
             ffmpeg_path = base_dir / ffmpeg_name
             ffprobe_path = base_dir / ffprobe_name
-            if ffmpeg_path.is_file() and ffprobe_path.is_file():
-                return FFmpegBinaries(str(ffmpeg_path), str(ffprobe_path))
+            if cls._is_usable_binary(ffmpeg_path) and cls._is_usable_binary(ffprobe_path):
+                return FFmpegBinaries(str(_safe_resolve_path(ffmpeg_path, strict=False)), str(_safe_resolve_path(ffprobe_path, strict=False)))
+
+        ffmpeg_path = shutil.which(ffmpeg_name) or shutil.which("ffmpeg")
+        ffprobe_path = shutil.which(ffprobe_name) or shutil.which("ffprobe")
+        if ffmpeg_path and ffprobe_path:
+            return FFmpegBinaries(str(_safe_resolve_path(ffmpeg_path, strict=False)), str(_safe_resolve_path(ffprobe_path, strict=False)))
 
         candidates = "\n".join(f"- {p}" for p in cls._candidate_dirs())
         raise FileNotFoundError(
-            "Portable FFmpeg binaries not found.\n"
-            f"Expected `{ffmpeg_name}` and `{ffprobe_name}` in one of:\n{candidates}"
+            "FFmpeg binaries not found.\n"
+            f"Looked for `{ffmpeg_name}` and `{ffprobe_name}` next to the app, in ./bin, and in PATH.\n"
+            f"Bundled search locations:\n{candidates}"
         )
 
 class VideoScanner:
@@ -84,18 +335,26 @@ class VideoScanner:
         self._on_log = on_log
 
     def scan(self, root_dir: str | Path) -> list[Path]:
-        root_path = Path(root_dir).expanduser().resolve()
-        if not root_path.exists():
+        root_path = _safe_resolve_path(root_dir, strict=False)
+        if not _safe_exists(root_path):
             self._on_log(f"[ERROR] {root_path} does not exist.")
             return []
-        if not root_path.is_dir():
-            self._on_log(f"[ERROR] {root_path} is not a directory.")
+        try:
+            if not root_path.is_dir():
+                self._on_log(f"[ERROR] {root_path} is not a directory.")
+                return []
+        except OSError as exc:
+            self._on_log(f"[ERROR] Could not access {root_path}: {exc}")
             return []
 
         video_paths: list[Path] = []
         trash_lower = TRASH_LOW_RES_DIRNAME.lower()
         group_lower = GROUP_DIR_PREFIX.lower()
-        for dirpath, dirnames, filenames in os.walk(root_path):
+
+        def _walk_error(exc: OSError) -> None:
+            self._on_log(f"[WARN] {_timestamp()} Directory walk skipped: {exc}")
+
+        for dirpath, dirnames, filenames in os.walk(root_path, onerror=_walk_error):
             dirnames[:] = [
                 d
                 for d in dirnames
@@ -103,10 +362,14 @@ class VideoScanner:
             ]
             for filename in filenames:
                 suffix = Path(filename).suffix.lower()
-                if suffix in VIDEO_EXTENSIONS:
-                    video_paths.append((Path(dirpath) / filename).resolve())
+                if suffix not in VIDEO_EXTENSIONS:
+                    continue
+                try:
+                    video_paths.append(_safe_resolve_path(Path(dirpath) / filename, strict=False))
+                except Exception as exc:
+                    self._on_log(f"[WARN] {_timestamp()} Skipping path {filename!r}: {exc}")
 
-        video_paths.sort(key=lambda p: str(p).lower())
+        video_paths.sort(key=_path_sort_key)
         self._on_log(f"[INFO] Found {len(video_paths)} video(s) under {root_path}.")
         return video_paths
 
@@ -123,10 +386,18 @@ class FFprobeValidator:
 
     def validate(self, video_path: str | Path) -> tuple[Optional[VideoMetadata], Optional[str]]:
         path_str = str(video_path)
-        if not Path(path_str).is_file():
+        if not _safe_is_file(path_str):
             return None, "Not a file."
 
-        creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        run_kwargs = {
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "text": True,
+            "timeout": self._timeout_s,
+        }
+        if os.name == "nt":
+            run_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
         cmd = [
             self._ffprobe_path,
             "-v",
@@ -134,20 +405,13 @@ class FFprobeValidator:
             "-select_streams",
             "v:0",
             "-show_entries",
-            "format=duration:stream=width,height",
+            "format=duration:stream=width,height,duration",
             "-of",
             "json",
             path_str,
         ]
         try:
-            proc = subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=self._timeout_s,
-                creationflags=creationflags,
-            )
+            proc = subprocess.run(cmd, **run_kwargs)
         except subprocess.TimeoutExpired:
             return None, "ffprobe timeout."
         except subprocess.SubprocessError as exc:
@@ -173,10 +437,21 @@ class FFprobeValidator:
         width = int(stream0.get("width") or 0)
         height = int(stream0.get("height") or 0)
 
-        duration_str = ((payload.get("format") or {}).get("duration") or "").strip()
-        try:
-            duration_s = float(duration_str)
-        except Exception:
+        duration_candidates = [
+            ((payload.get("format") or {}).get("duration") or "").strip(),
+            str(stream0.get("duration") or "").strip(),
+        ]
+        duration_s = 0.0
+        for duration_str in duration_candidates:
+            if not duration_str:
+                continue
+            try:
+                duration_s = float(duration_str)
+            except Exception:
+                continue
+            if math.isfinite(duration_s) and duration_s > 0:
+                break
+        else:
             duration_s = 0.0
 
         if width <= 0 or height <= 0:
@@ -197,7 +472,7 @@ class FingerprintConfig:
 @dataclass(frozen=True, slots=True)
 class MatchConfig:
     duplicate_similarity: float = 0.85
-    consensus_prefilter_similarity: float = 0.75
+    consensus_prefilter_similarity: float = 0.65
     max_offset_s: int = 600
     min_overlap_frames: int = 10
 
@@ -224,8 +499,19 @@ class EngineCallbacks:
     should_cancel: Callable[[], bool] = lambda: False
 
 class DedupDatabase:
+    _EXPECTED_COLUMNS = {
+        "cache_key",
+        "display_rel_path",
+        "file_size",
+        "mtime_ns",
+        "fast_sig",
+        "duration",
+        "phash_data",
+        "consensus_hash",
+    }
+
     def __init__(self, db_path: str | Path, *, commit_every: int = 10):
-        self._db_path = Path(db_path).expanduser().resolve()
+        self._db_path = _safe_resolve_path(db_path, strict=False)
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self._commit_every = max(1, int(commit_every))
@@ -241,17 +527,34 @@ class DedupDatabase:
 
     def _init_schema(self) -> None:
         with self._lock:
+            existing = self._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='video_cache'"
+            ).fetchone()
+            if existing is not None:
+                columns = {
+                    str(row["name"])
+                    for row in self._conn.execute("PRAGMA table_info(video_cache)").fetchall()
+                }
+                if not self._EXPECTED_COLUMNS.issubset(columns):
+                    self._conn.execute("DROP TABLE IF EXISTS video_cache")
+                    self._conn.commit()
+
             self._conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS video_cache (
-                    path TEXT PRIMARY KEY,
-                    file_size INTEGER,
-                    mtime REAL,
-                    duration REAL,
-                    phash_data BLOB,
-                    consensus_hash TEXT
+                    cache_key TEXT PRIMARY KEY,
+                    display_rel_path TEXT,
+                    file_size INTEGER NOT NULL,
+                    mtime_ns INTEGER,
+                    fast_sig TEXT,
+                    duration REAL NOT NULL,
+                    phash_data BLOB NOT NULL,
+                    consensus_hash TEXT NOT NULL
                 );
                 """
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_video_cache_display_rel_path ON video_cache(display_rel_path)"
             )
             self._conn.commit()
 
@@ -298,13 +601,18 @@ class DedupDatabase:
         return None
 
     def get_fingerprint(
-        self, path: str, file_size: int, mtime: float
+        self,
+        cache_key: str,
+        *,
+        file_size: int,
+        mtime_ns: int,
+        fast_sig: Optional[str],
     ) -> Optional[tuple[float, np.ndarray, int]]:
         try:
             with self._lock:
                 row = self._conn.execute(
-                    "SELECT file_size, mtime, duration, phash_data, consensus_hash FROM video_cache WHERE path = ?",
-                    (path,),
+                    "SELECT file_size, mtime_ns, fast_sig, duration, phash_data, consensus_hash FROM video_cache WHERE cache_key = ?",
+                    (cache_key,),
                 ).fetchone()
         except sqlite3.Error:
             return None
@@ -312,12 +620,18 @@ class DedupDatabase:
         if row is None:
             return None
 
-        row_size = int(row["file_size"] or -1)
-        row_mtime = float(row["mtime"] or -1.0)
-        if row_size != int(file_size):
+        if int(row["file_size"] or -1) != int(file_size):
             return None
-        if not (abs(row_mtime - float(mtime)) < Thresholds.MTIME_TOLERANCE_S):
-            return None
+
+        row_fast_sig = row["fast_sig"]
+        row_mtime_ns = row["mtime_ns"]
+
+        if fast_sig and row_fast_sig:
+            if str(row_fast_sig) != str(fast_sig):
+                return None
+        else:
+            if row_mtime_ns is None or int(row_mtime_ns) != int(mtime_ns):
+                return None
 
         blob = row["phash_data"]
         consensus = row["consensus_hash"]
@@ -330,14 +644,14 @@ class DedupDatabase:
             hashes = pickle.loads(blob_bytes)
         except Exception:
             try:
-                self.delete(path)
+                self.delete(cache_key)
             except Exception:
                 pass
             return None
 
         if not isinstance(hashes, np.ndarray):
             try:
-                self.delete(path)
+                self.delete(cache_key)
             except Exception:
                 pass
             return None
@@ -345,7 +659,7 @@ class DedupDatabase:
         consensus_int = self._consensus_from_db(consensus)
         if consensus_int is None:
             try:
-                self.delete(path)
+                self.delete(cache_key)
             except Exception:
                 pass
             return None
@@ -355,38 +669,52 @@ class DedupDatabase:
     def upsert_fingerprint(
         self,
         *,
-        path: str,
+        cache_key: str,
+        display_rel_path: str,
         file_size: int,
-        mtime: float,
+        mtime_ns: int,
+        fast_sig: Optional[str],
         duration: float,
         hashes: np.ndarray,
         consensus_hash: int,
     ) -> None:
-        blob = sqlite3.Binary(pickle.dumps(hashes, protocol=pickle.HIGHEST_PROTOCOL))
+        hashes_arr = np.asarray(hashes, dtype=np.uint64)
+        blob = sqlite3.Binary(pickle.dumps(hashes_arr, protocol=pickle.HIGHEST_PROTOCOL))
         consensus_hex = self._consensus_to_db(consensus_hash)
         with self._lock:
             self._conn.execute(
                 """
-                INSERT INTO video_cache(path, file_size, mtime, duration, phash_data, consensus_hash)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(path) DO UPDATE SET
+                INSERT INTO video_cache(cache_key, display_rel_path, file_size, mtime_ns, fast_sig, duration, phash_data, consensus_hash)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(cache_key) DO UPDATE SET
+                    display_rel_path=excluded.display_rel_path,
                     file_size=excluded.file_size,
-                    mtime=excluded.mtime,
+                    mtime_ns=excluded.mtime_ns,
+                    fast_sig=excluded.fast_sig,
                     duration=excluded.duration,
                     phash_data=excluded.phash_data,
                     consensus_hash=excluded.consensus_hash
                 """,
-                (path, int(file_size), float(mtime), float(duration), blob, consensus_hex),
+                (
+                    cache_key,
+                    display_rel_path,
+                    int(file_size),
+                    int(mtime_ns),
+                    fast_sig,
+                    float(duration),
+                    blob,
+                    consensus_hex,
+                ),
             )
             self._pending_writes += 1
             if self._pending_writes >= self._commit_every:
                 self._conn.commit()
                 self._pending_writes = 0
 
-    def delete(self, path: str) -> None:
+    def delete(self, cache_key: str) -> None:
         with self._lock:
             try:
-                self._conn.execute("DELETE FROM video_cache WHERE path = ?", (path,))
+                self._conn.execute("DELETE FROM video_cache WHERE cache_key = ?", (cache_key,))
             except sqlite3.Error:
                 return
             self._pending_writes += 1
@@ -403,31 +731,22 @@ class DedupDatabase:
             except Exception:
                 pass
 
-    def cleanup_stale_entries(self, valid_paths: set[str]) -> int:
-
-        if not valid_paths:
-            return 0
-
+    def cleanup_stale_entries(self, valid_cache_keys: set[str]) -> int:
         with self._lock:
             try:
-                cursor = self._conn.execute("SELECT path FROM video_cache")
-                cached_paths = {row[0] for row in cursor.fetchall()}
+                cursor = self._conn.execute("SELECT cache_key FROM video_cache")
+                cached_keys = {str(row[0]) for row in cursor.fetchall()}
             except sqlite3.Error:
                 return 0
 
-            stale_paths = cached_paths - valid_paths
-            if not stale_paths:
+            stale_keys = cached_keys - valid_cache_keys
+            if not stale_keys:
                 return 0
 
-            for path in stale_paths:
-                try:
-                    self._conn.execute("DELETE FROM video_cache WHERE path = ?", (path,))
-                except sqlite3.Error:
-                    continue
-
+            self._conn.executemany("DELETE FROM video_cache WHERE cache_key = ?", ((key,) for key in stale_keys))
             self._conn.commit()
             self._pending_writes = 0
-            return len(stale_paths)
+            return len(stale_keys)
 
 class BKTree:
     class _Node:
@@ -518,7 +837,7 @@ def consensus_hash_uint64(hashes: np.ndarray) -> int:
     bytes_view = hashes.astype(np.uint64, copy=False).view(np.uint8).reshape(-1, 8)
     bits = np.unpackbits(bytes_view, axis=1, bitorder="little")
     bit_means = bits.mean(axis=0)
-    consensus_bits = (bit_means >= 0.5).astype(np.uint8, copy=False)
+    consensus_bits = (bit_means > 0.5).astype(np.uint8, copy=False)
     packed = np.packbits(consensus_bits, bitorder="little")
     return int.from_bytes(packed.tobytes(), byteorder="little", signed=False)
 
@@ -549,71 +868,67 @@ def best_time_shift_similarity(
     len_a = int(a.size)
     len_b = int(b.size)
 
-    full_range_low = -(len_b - 1)
-    full_range_high = len_a - 1
-    low = max(full_range_low, -max_offset_frames)
-    high = min(full_range_high, max_offset_frames)
+    effective_min_overlap = max(1, min(int(min_overlap_frames), len_a, len_b))
+    # Search the exact offset range that can still meet the required overlap. The old coarse pass could
+    # miss the true optimum, and its offset bounds were wrong for unequal-length clips.
+    full_range_low = -(len_a - effective_min_overlap)
+    full_range_high = len_b - effective_min_overlap
+    low = max(full_range_low, -int(max_offset_frames))
+    high = min(full_range_high, int(max_offset_frames))
+    if low > high:
+        return 0.0, 0, 0
 
-    best_similarity = 0.0
+    best_similarity = -1.0
     best_offset = 0
     best_overlap = 0
 
-    offset_span = high - low
-    coarse_step = 1
-    if offset_span > Thresholds.COARSE_THRESHOLD:
-        coarse_step = Thresholds.COARSE_STEP
+    max_possible_overlap = min(len_a, len_b)
 
     def eval_offset(offset_frames: int) -> tuple[float, int]:
         a_start = max(0, -offset_frames)
         b_start = max(0, offset_frames)
         overlap = min(len_a - a_start, len_b - b_start)
-        if overlap < min_overlap_frames:
+        if overlap < effective_min_overlap:
             return 0.0, 0
+
         a_seg = a[a_start : a_start + overlap]
         b_seg = b[b_start : b_start + overlap]
-        mean_dist = float(bitwise_count_uint64(np.bitwise_xor(a_seg, b_seg)).mean())
-        return 1.0 - (mean_dist / float(Thresholds.PHASH_BITS)), overlap
+        distance_sum = int(bitwise_count_uint64(np.bitwise_xor(a_seg, b_seg)).sum())
+        similarity = 1.0 - (distance_sum / float(Thresholds.PHASH_BITS * overlap))
+        return similarity, overlap
 
-    top_candidates: list[tuple[float, int, int]] = []
-    for offset_frames in range(low, high + 1, coarse_step):
+    for offset_frames in range(low, high + 1):
         similarity, overlap = eval_offset(offset_frames)
-        if overlap < min_overlap_frames:
+        if overlap < effective_min_overlap:
             continue
 
-        if similarity > best_similarity:
+        if _is_better_alignment(
+            similarity,
+            overlap,
+            offset_frames,
+            best_similarity,
+            best_overlap,
+            best_offset,
+        ):
             best_similarity = similarity
             best_offset = offset_frames
             best_overlap = overlap
-            if early_exit_threshold > 0 and best_similarity >= early_exit_threshold:
-                return best_similarity, best_offset, best_overlap
 
-        if coarse_step > 1:
-            top_candidates.append((similarity, offset_frames, overlap))
-            top_candidates.sort(reverse=True, key=lambda x: x[0])
-            del top_candidates[3:]
+            if (
+                early_exit_threshold > 0
+                and similarity >= 1.0 - 1e-12
+                and overlap >= max_possible_overlap
+            ):
+                break
 
-    if coarse_step > 1 and top_candidates:
-        refined_offsets: set[int] = set()
-        for _sim, candidate_offset, _overlap in top_candidates:
-            for off in range(candidate_offset - coarse_step, candidate_offset + coarse_step + 1):
-                if low <= off <= high:
-                    refined_offsets.add(off)
-
-        for offset_frames in sorted(refined_offsets):
-            similarity, overlap = eval_offset(offset_frames)
-            if overlap < min_overlap_frames:
-                continue
-            if similarity > best_similarity:
-                best_similarity = similarity
-                best_offset = offset_frames
-                best_overlap = overlap
-                if early_exit_threshold > 0 and best_similarity >= early_exit_threshold:
-                    return best_similarity, best_offset, best_overlap
-
+    if best_similarity < 0:
+        return 0.0, 0, 0
     return best_similarity, best_offset, best_overlap
 
 def _fingerprint_video_worker(
     video_path: str,
+    cache_key: str,
+    display_rel_path: str,
     binaries: FFmpegBinaries,
     fingerprint_config: FingerprintConfig,
     cancel_event: threading.Event,
@@ -641,11 +956,7 @@ def _fingerprint_video_worker(
         except Exception:
             pass
 
-    path_obj = Path(video_path).expanduser()
-    try:
-        path_obj = path_obj.resolve()
-    except Exception:
-        path_obj = Path(os.path.abspath(str(path_obj)))
+    path_obj = _safe_resolve_path(video_path, strict=False)
     path_str = str(path_obj)
     video_name = path_obj.name
     on_log(f"[START] Processing: {video_name}")
@@ -657,12 +968,18 @@ def _fingerprint_video_worker(
     try:
         stat = path_obj.stat()
         file_size = int(stat.st_size)
-        mtime = float(stat.st_mtime)
+        mtime_ns = int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000)))
     except Exception as exc:
         on_log(f"[DONE] Finished: {video_name} (skipped: stat failed: {exc})")
         return {"path": path_str, "ok": False, "error": f"stat failed: {exc}"}
 
-    cached = db.get_fingerprint(path_str, file_size, mtime)
+    fast_sig = _fast_file_signature(path_obj, file_size)
+    cached = db.get_fingerprint(
+        cache_key,
+        file_size=file_size,
+        mtime_ns=mtime_ns,
+        fast_sig=fast_sig,
+    )
     if cached is not None:
         duration_s, hashes_arr, consensus = cached
         on_log(f"[HASH] Loaded {int(hashes_arr.size)} frames from cache for: {video_name}")
@@ -674,7 +991,7 @@ def _fingerprint_video_worker(
             "hashes": hashes_arr,
             "consensus": int(consensus),
             "file_size": file_size,
-            "mtime": mtime,
+            "mtime_ns": mtime_ns,
             "cached": True,
         }
 
@@ -720,34 +1037,34 @@ def _fingerprint_video_worker(
         "gray",
         "-",
     ]
-    creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+
+    popen_kwargs = {
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+    }
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
     proc: subprocess.Popen[bytes] | None = None
     hashes: list[int] = []
-    capture_stderr = os.environ.get("VIDEO_DEDUP_DEBUG_FFMPEG", "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-    stderr_buffer: list[bytes] = []
+    stderr_buffer = bytearray()
     stderr_thread: threading.Thread | None = None
 
     try:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE if capture_stderr else subprocess.DEVNULL,
-            creationflags=creationflags,
-        )
+        proc = subprocess.Popen(cmd, **popen_kwargs)
 
-        if capture_stderr and proc.stderr is not None:
+        if proc.stderr is not None:
             stderr_pipe = proc.stderr
 
             def _drain_stderr(pipe) -> None:
                 try:
-                    data = pipe.read()
-                    if data:
-                        stderr_buffer.append(data)
+                    while True:
+                        chunk = pipe.read(4096)
+                        if not chunk:
+                            break
+                        stderr_buffer.extend(chunk)
+                        if len(stderr_buffer) > 65536:
+                            del stderr_buffer[:-65536]
                 except Exception:
                     pass
 
@@ -775,11 +1092,13 @@ def _fingerprint_video_worker(
             proc.wait()
 
         if stderr_thread is not None:
-            stderr_thread.join(timeout=0.5)
-        stderr = b"".join(stderr_buffer).decode(errors="replace").strip()
-        if proc.returncode != 0 and not hashes:
-            on_log(f"[DONE] Finished: {video_name} (failed: {stderr or f'ffmpeg rc={proc.returncode}'})")
-            return {"path": path_str, "ok": False, "error": stderr or f"ffmpeg rc={proc.returncode}"}
+            stderr_thread.join(timeout=1.0)
+
+        stderr = bytes(stderr_buffer).decode(errors="replace").strip()
+        if proc.returncode != 0:
+            error_message = stderr or f"ffmpeg rc={proc.returncode}"
+            on_log(f"[DONE] Finished: {video_name} (failed: {error_message})")
+            return {"path": path_str, "ok": False, "error": error_message}
     except subprocess.TimeoutExpired:
         if proc:
             _kill_chain(proc)
@@ -816,9 +1135,11 @@ def _fingerprint_video_worker(
     duration_s = float(meta.duration_s)
     try:
         db.upsert_fingerprint(
-            path=path_str,
+            cache_key=cache_key,
+            display_rel_path=display_rel_path,
             file_size=file_size,
-            mtime=mtime,
+            mtime_ns=mtime_ns,
+            fast_sig=fast_sig,
             duration=duration_s,
             hashes=hashes_arr,
             consensus_hash=int(consensus),
@@ -834,7 +1155,7 @@ def _fingerprint_video_worker(
         "hashes": hashes_arr,
         "consensus": int(consensus),
         "file_size": file_size,
-        "mtime": mtime,
+        "mtime_ns": mtime_ns,
         "cached": False,
     }
 
@@ -886,7 +1207,7 @@ class VideoDedupEngine:
         progress = self._callbacks.progress
         should_cancel = self._callbacks.should_cancel
 
-        root_path = Path(root_dir).expanduser().resolve()
+        root_path = _safe_resolve_path(root_dir, strict=False)
         folders = sorted([p for p in root_path.glob(f"{prefix}*") if p.is_dir()], key=lambda p: p.name.lower())
         if not folders:
             return {"moved_back": 0, "removed_folders": 0}
@@ -902,7 +1223,11 @@ class VideoDedupEngine:
                 if should_cancel():
                     log(f"[INFO] {_timestamp()} Cleanup cancelled.")
                     return {"moved_back": moved_back, "removed_folders": removed_folders, "cancelled": True}
-                self._safe_move_to_dir(file_path, root_path)
+                try:
+                    self._safe_move_to_dir(file_path, root_path)
+                except Exception as exc:
+                    log(f"[WARN] {_timestamp()} Cleanup failed to move {file_path.name}: {exc}")
+                    continue
                 moved_back += 1
                 done += 1
                 if total_files:
@@ -923,7 +1248,7 @@ class VideoDedupEngine:
         stage = self._callbacks.stage
         should_cancel = self._callbacks.should_cancel
 
-        root_path = Path(root_dir).expanduser().resolve()
+        root_path = _safe_resolve_path(root_dir, strict=False)
         stage("Cleanup")
         scanner = VideoScanner(on_log=log)
         video_paths = scanner.scan(root_path)
@@ -983,7 +1308,7 @@ class VideoDedupEngine:
         progress = self._callbacks.progress
         should_cancel = self._callbacks.should_cancel
 
-        root_path = Path(root_dir).expanduser().resolve()
+        root_path = _safe_resolve_path(root_dir, strict=False)
         videos = self._list_videos_in_root(root_path)
         if not videos:
             progress(0)
@@ -1034,7 +1359,11 @@ class VideoDedupEngine:
                         "files_moved": files_moved,
                         "cancelled": True,
                     }
-                self._safe_move_to_dir(src, dest)
+                try:
+                    self._safe_move_to_dir(src, dest)
+                except Exception as exc:
+                    log(f"[WARN] {_timestamp()} Phase 1 failed to move {src.name}: {exc}")
+                    continue
                 files_moved += 1
                 moved_so_far += 1
                 if total_to_move:
@@ -1049,7 +1378,7 @@ class VideoDedupEngine:
         progress = self._callbacks.progress
         should_cancel = self._callbacks.should_cancel
 
-        root_path = Path(root_dir).expanduser().resolve()
+        root_path = _safe_resolve_path(root_dir, strict=False)
         cleanup = self._cleanup_group_folders(root_path, "Group_Size_")
         if cleanup.get("cancelled"):
             return {"processed": 0, "groups_created": 0, "files_moved": 0, "trashed_low_res": 0, "cancelled": True}
@@ -1115,7 +1444,11 @@ class VideoDedupEngine:
                         "trashed_low_res": trashed_low_res,
                         "cancelled": True,
                     }
-                self._safe_move_to_dir(src, dest)
+                try:
+                    self._safe_move_to_dir(src, dest)
+                except Exception as exc:
+                    log(f"[WARN] {_timestamp()} Phase 2 failed to move {src.name}: {exc}")
+                    continue
                 files_moved += 1
                 moved_so_far += 1
                 if total_to_move:
@@ -1132,7 +1465,7 @@ class VideoDedupEngine:
         }
 
     def run_phase_3_prepare(self, root_dir: str | Path) -> dict:
-        root_path = Path(root_dir).expanduser().resolve()
+        root_path = _safe_resolve_path(root_dir, strict=False)
         return self._cleanup_group_folders(root_path, "Group_Time_")
 
     def run_phase_3_content(self, root_dir: str | Path) -> dict:
@@ -1142,21 +1475,22 @@ class VideoDedupEngine:
         on_result = self._callbacks.result
         should_cancel = self._callbacks.should_cancel
 
-        root_path = Path(root_dir).expanduser().resolve()
+        root_path = _safe_resolve_path(root_dir, strict=False)
         db: DedupDatabase | None = None
         try:
             stage("Hashing/Loading")
             log(f"[INFO] {_timestamp()} Phase 3: Loading fingerprints (cache/ffmpeg)...")
             scanner = VideoScanner(on_log=log)
             video_paths = scanner.scan(root_path)
-            total_videos = len(video_paths)
+            video_records = [(p, *_make_cache_identity(root_path, p)) for p in video_paths]
+            total_videos = len(video_records)
             if total_videos == 0:
                 progress(0)
                 log(f"[INFO] {_timestamp()} Phase 3: Nothing to do.")
                 return {"processed": 0, "duplicates": 0, "cancelled": False}
 
             db = DedupDatabase(root_path / CACHE_DB_FILENAME)
-            stale_count = db.cleanup_stale_entries({str(p) for p in video_paths})
+            stale_count = db.cleanup_stale_entries({cache_key for _p, cache_key, _rel in video_records})
             if stale_count > 0:
                 log(f"[INFO] {_timestamp()} Removed {stale_count} stale cache entries.")
             cancel_event = threading.Event()
@@ -1175,17 +1509,19 @@ class VideoDedupEngine:
             def log_error_for(path_str: str, error: str) -> None:
                 log(f"[WARN] {_timestamp()} Skipping: {path_str} ({error})")
 
-            path_iter = iter([str(p) for p in video_paths])
+            path_iter = iter(video_records)
             pending: set = set()
 
             def submit_next(executor: ThreadPoolExecutor) -> bool:
                 try:
-                    path = next(path_iter)
+                    path, cache_key, display_rel_path = next(path_iter)
                 except StopIteration:
                     return False
                 fut = executor.submit(
                     _fingerprint_video_worker,
-                    path,
+                    str(path),
+                    cache_key,
+                    display_rel_path,
                     self._binaries,
                     fp_config,
                     cancel_event,
@@ -1215,7 +1551,13 @@ class VideoDedupEngine:
                         if cancelling:
                             continue
 
-                        result = fut.result()
+                        try:
+                            result = fut.result()
+                        except Exception as exc:
+                            log_error_for("<worker>", f"Unhandled worker exception: {exc}")
+                            log(traceback.format_exc())
+                            continue
+
                         if not result.get("ok"):
                             if result.get("cancelled"):
                                 cancelling = True
@@ -1249,10 +1591,12 @@ class VideoDedupEngine:
                 return {"processed": 0, "duplicates": 0, "cancelled": False}
 
             stage("Indexing/Comparing")
-            max_hamming = int(round((1.0 - float(match_config.consensus_prefilter_similarity)) * float(Thresholds.PHASH_BITS)))
-            max_hamming = max(0, min(Thresholds.PHASH_BITS, max_hamming))
-            log(f"[INFO] {_timestamp()} Phase 3: BK-Tree prefilter <= {max_hamming} bit(s)")
-            log(f"[INFO] {_timestamp()} Phase 3: Streaming BK-Tree compare...")
+            base_max_hamming = _prefilter_hamming_radius(
+                float(match_config.consensus_prefilter_similarity),
+                frame_count=max(int(fp.hashes.size) for fp in fingerprints),
+            )
+            log(f"[INFO] {_timestamp()} Phase 3: BK-Tree prefilter <= {base_max_hamming} bit(s) (loose consensus gate)")
+            log(f"[INFO] {_timestamp()} Phase 3: Exact offset search across BK-Tree candidates...")
             progress(0)
             tree = BKTree(hamming_distance_uint64_scalar)
             duplicates_found = 0
@@ -1263,6 +1607,10 @@ class VideoDedupEngine:
                     cancelling = True
                     break
 
+                max_hamming = _prefilter_hamming_radius(
+                    float(match_config.consensus_prefilter_similarity),
+                    frame_count=int(fp.hashes.size),
+                )
                 neighbors = tree.query(fp.consensus_hash, max_hamming)
                 for j in neighbors:
                     if should_cancel():
@@ -1270,19 +1618,22 @@ class VideoDedupEngine:
                         break
 
                     other = fingerprints[j]
-                    if abs(fp.duration_s - other.duration_s) > (match_config.max_offset_s + Thresholds.DURATION_PADDING_S):
-                        continue
+                    pair_min_overlap = max(1, min(min_overlap, int(other.hashes.size), int(fp.hashes.size)))
 
                     comparisons_run += 1
                     similarity, offset_frames, overlap_frames = best_time_shift_similarity(
                         other.hashes,
                         fp.hashes,
                         max_offset_frames=max_offset_frames,
-                        min_overlap_frames=min_overlap,
+                        min_overlap_frames=pair_min_overlap,
                         early_exit_threshold=float(match_config.duplicate_similarity),
                     )
 
-                    if similarity >= match_config.duplicate_similarity:
+                    required_similarity = _effective_duplicate_similarity(
+                        float(match_config.duplicate_similarity),
+                        int(overlap_frames),
+                    )
+                    if similarity >= required_similarity:
                         duplicates_found += 1
                         offset_s = offset_frames / fp_config.sample_fps if fp_config.sample_fps else 0.0
                         on_result(
@@ -1300,9 +1651,11 @@ class VideoDedupEngine:
                 tree.add(fp.consensus_hash, i)
                 if i % Thresholds.PROGRESS_INTERVAL == 0 or i == len(fingerprints) - 1:
                     progress(int(((i + 1) / len(fingerprints)) * 100))
+
             if cancelling:
                 log(f"[INFO] {_timestamp()} Cancelled.")
                 return {"processed": len(fingerprints), "duplicates": duplicates_found, "cancelled": True}
+
             progress(100)
             log(
                 f"[INFO] {_timestamp()} Done. Processed {len(fingerprints)} valid video(s). "
@@ -1511,7 +1864,7 @@ def run_gui(binaries: FFmpegBinaries) -> int:
             self.continue_button.clicked.connect(self._on_continue)
             self.stop_button.clicked.connect(self._on_stop)
 
-            default_dir = Path(os.getcwd()).resolve()
+            default_dir = _safe_resolve_path(os.getcwd(), strict=False)
             self.path_edit.setText(str(default_dir))
 
         def _append_log(self, message: str) -> None:
@@ -1613,13 +1966,13 @@ def run_gui(binaries: FFmpegBinaries) -> int:
                 self.continue_button.setEnabled(True)
                 self._append_log("Phase 1 Complete. Click Continue when ready.")
                 if self._root_dir:
-                    self._reveal_in_explorer(self._root_dir)
+                    self._open_directory_in_file_manager(self._root_dir)
             elif task == "phase2_time":
                 self.continue_button.setVisible(True)
                 self.continue_button.setEnabled(True)
                 self._append_log("Phase 2 Complete. Click Continue to proceed.")
                 if self._root_dir:
-                    self._reveal_in_explorer(self._root_dir)
+                    self._open_directory_in_file_manager(self._root_dir)
             elif task == "phase3_prepare":
                 reply = QMessageBox.question(
                     self,
@@ -1652,36 +2005,38 @@ def run_gui(binaries: FFmpegBinaries) -> int:
                 self.stop_button.setEnabled(False)
                 self._worker = None
 
-        def _reveal_in_explorer(self, path: str) -> None:
-            target = Path(path).resolve()
-            if target.is_file():
-                QDesktopServices.openUrl(QUrl.fromLocalFile(str(target.parent)))
-            else:
-                QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
+        def _open_directory_in_file_manager(self, path: str) -> None:
+            target = _safe_resolve_path(path, strict=False)
+            if not _safe_exists(target):
+                self._append_log(f"[WARN] {_timestamp()} Folder not found: {path}")
+                return
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
 
         def _open_file_location(self, path: str) -> None:
             path_str = str(path).strip()
             if not path_str:
                 return
-            p = Path(path_str)
-            if not p.exists():
+            p = _safe_resolve_path(path_str, strict=False)
+            if not _safe_exists(p):
                 self._append_log(f"[WARN] {_timestamp()} File not found: {path_str}")
                 QMessageBox.warning(self, "File not found", f"File does not exist:\n\n{path_str}")
                 return
-            if os.name == "nt":
-                try:
-                    subprocess.Popen(["explorer", f'/select,"{str(p)}"'])
-                except Exception as exc:
-                    self._append_log(f"[WARN] {_timestamp()} Failed to open Explorer: {exc}")
-            else:
-                QDesktopServices.openUrl(QUrl.fromLocalFile(str(p.parent)))
+
+            ok, mechanism = reveal_in_file_manager(p)
+            if not ok:
+                self._append_log(f"[WARN] {_timestamp()} Failed to reveal in file manager: {mechanism}")
+                QMessageBox.warning(
+                    self,
+                    "Reveal failed",
+                    f"Could not reveal the file in the system file manager.\n\n{path_str}\n\n{mechanism}",
+                )
 
         def _play_video(self, path: str) -> None:
             path_str = str(path).strip()
             if not path_str:
                 return
-            p = Path(path_str)
-            if not p.exists():
+            p = _safe_resolve_path(path_str, strict=False)
+            if not _safe_exists(p):
                 self._append_log(f"[WARN] {_timestamp()} File not found: {path_str}")
                 QMessageBox.warning(self, "File not found", f"File does not exist:\n\n{path_str}")
                 return
@@ -1697,8 +2052,8 @@ def run_gui(binaries: FFmpegBinaries) -> int:
             path_str = str(path).strip()
             if not path_str:
                 return
-            p = Path(path_str)
-            if not p.exists():
+            p = _safe_resolve_path(path_str, strict=False)
+            if not _safe_exists(p):
                 self._append_log(f"[WARN] {_timestamp()} File not found: {path_str}")
                 QMessageBox.warning(self, "File not found", f"File does not exist:\n\n{path_str}")
                 return
@@ -1712,6 +2067,25 @@ def run_gui(binaries: FFmpegBinaries) -> int:
                     "MediaInfo was not found in your PATH.\n\nInstall MediaInfo CLI or add MediaInfo.exe to PATH.",
                 )
                 return
+
+            if os.name != "nt" and Path(exe).name.lower() == "mediainfo":
+                try:
+                    proc = subprocess.run(
+                        [exe, str(p)],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        timeout=20,
+                    )
+                    output = (proc.stdout or proc.stderr or "").strip()
+                    if proc.returncode != 0:
+                        raise RuntimeError(output or f"mediainfo rc={proc.returncode}")
+                    QMessageBox.information(self, "MediaInfo", output or f"No MediaInfo output for:\n\n{p}")
+                except Exception as exc:
+                    self._append_log(f"[WARN] {_timestamp()} Failed to run MediaInfo: {exc}")
+                    QMessageBox.warning(self, "MediaInfo failed", f"Could not run MediaInfo:\n\n{path_str}\n\n{exc}")
+                return
+
             try:
                 subprocess.Popen([exe, str(p)])
             except Exception as exc:
@@ -1721,8 +2095,8 @@ def run_gui(binaries: FFmpegBinaries) -> int:
             path_str = str(path).strip()
             if not path_str:
                 return
-            p = Path(path_str)
-            if not p.exists():
+            p = _safe_resolve_path(path_str, strict=False)
+            if not _safe_exists(p):
                 self._append_log(f"[WARN] {_timestamp()} File not found: {path_str}")
                 QMessageBox.warning(self, "File not found", f"File does not exist:\n\n{path_str}")
                 self._refresh_table_state()
@@ -1783,8 +2157,8 @@ def run_gui(binaries: FFmpegBinaries) -> int:
                 path_a = self._get_raw_path(row, 0)
                 path_b = self._get_raw_path(row, 1)
 
-                exists_a = bool(path_a and Path(path_a).exists())
-                exists_b = bool(path_b and Path(path_b).exists())
+                exists_a = bool(path_a and _safe_exists(path_a))
+                exists_b = bool(path_b and _safe_exists(path_b))
 
                 item_a = self.results_table.item(row, 0)
                 item_b = self.results_table.item(row, 1)
@@ -1835,7 +2209,7 @@ def run_gui(binaries: FFmpegBinaries) -> int:
             menu = QMenu(self)
 
             action_play = menu.addAction("Play Video")
-            action_reveal = menu.addAction("Reveal in Explorer")
+            action_reveal = menu.addAction("Reveal in File Manager")
             action_mediainfo = menu.addAction("MediaInfo")
             menu.addSeparator()
             action_delete = menu.addAction("Delete File")
@@ -1925,8 +2299,8 @@ def main() -> int:
         QMessageBox.critical(
             None,
             "FFmpeg Missing",
-            "ffmpeg.exe and ffprobe.exe not found in the current directory or ./bin.\n\n"
-            "Place portable FFmpeg binaries next to this script or in a ./bin folder.",
+            "FFmpeg was not found.\n\n"
+            "Install ffmpeg/ffprobe in PATH, or place matching binaries next to this script or in a ./bin folder.",
         )
         return 1
 
