@@ -1,6 +1,8 @@
 from __future__ import annotations
-import json
+import csv
 import hashlib
+import html
+import json
 import math
 import os
 import pickle
@@ -30,7 +32,7 @@ class Thresholds:
 
     MIN_RESOLUTION_PX: int = 480
     PHASH_BITS: int = 64
-    DURATION_TOLERANCE_S: float = 0.1
+    DURATION_TOLERANCE_S: float = 1.0
     MTIME_TOLERANCE_S: float = 2.0 
     PROGRESS_INTERVAL: int = 25
     COARSE_STEP: int = 5
@@ -49,6 +51,57 @@ def _timestamp() -> str:
 
 def _noop(*_args, **_kwargs) -> None:
     return None
+
+
+def _human_readable_size(size_bytes: int) -> str:
+    try:
+        size = float(max(0, int(size_bytes)))
+    except Exception:
+        return "N/A"
+
+    units = ["B", "KB", "MB", "GB", "TB", "PB"]
+    unit_index = 0
+    while size >= 1024.0 and unit_index < len(units) - 1:
+        size /= 1024.0
+        unit_index += 1
+
+    if unit_index == 0:
+        return f"{int(size)} {units[unit_index]}"
+    return f"{size:.2f} {units[unit_index]}"
+
+
+def _format_duration(seconds: float) -> str:
+    try:
+        total_seconds = int(round(float(seconds)))
+    except Exception:
+        return "N/A"
+
+    if total_seconds < 0:
+        total_seconds = 0
+
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours > 0:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def _format_eta(seconds: float | int | None) -> str:
+    if seconds is None:
+        return "ETA: --"
+    try:
+        remaining = max(0, int(round(float(seconds))))
+    except Exception:
+        return "ETA: --"
+
+    hours, remainder = divmod(remaining, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours > 0:
+        return f"ETA: ~{hours}h {minutes:02d}m"
+    if minutes > 0:
+        return f"ETA: ~{minutes}m {secs:02d}s"
+    return f"ETA: ~{secs}s"
+
 
 def _safe_resolve_path(path: str | Path, *, strict: bool = False) -> Path:
     path_obj = Path(path).expanduser()
@@ -273,14 +326,16 @@ def _is_better_alignment(
         return False
     return offset_frames < best_offset_frames
 
-def _prefilter_hamming_radius(base_similarity: float, frame_count: int) -> int:
+def _prefilter_hamming_radius(base_similarity: float, frame_count: int, *, min_radius: int = 14) -> int:
     radius = int(round((1.0 - float(base_similarity)) * float(Thresholds.PHASH_BITS)))
     radius = max(0, min(Thresholds.PHASH_BITS, radius))
-    # A whole-video consensus hash is only a loose gate, so keep the radius conservative.
-    radius = max(radius, 20)
+    # A whole-video consensus hash is only a loose gate, so keep the radius conservative,
+    # but avoid the overly-wide 20-bit floor that floods the BK-Tree with candidates.
+    radius = max(radius, int(min_radius))
     if frame_count < 30:
         radius = min(Thresholds.PHASH_BITS, radius + 4)
     return radius
+
 
 
 @dataclass(frozen=True, slots=True)
@@ -472,15 +527,19 @@ class FingerprintConfig:
 @dataclass(frozen=True, slots=True)
 class MatchConfig:
     duplicate_similarity: float = 0.85
-    consensus_prefilter_similarity: float = 0.65
+    consensus_prefilter_similarity: float = 0.75
+    consensus_min_hamming_radius: int = 14
     max_offset_s: int = 600
     min_overlap_frames: int = 10
+
 
 @dataclass(frozen=True, slots=True)
 class EngineConfig:
     fingerprint: FingerprintConfig = FingerprintConfig()
     match: MatchConfig = MatchConfig()
-    max_threads: int = 3
+    max_threads: int = min(os.cpu_count() or 4, 6)
+    duration_tolerance_s: float = Thresholds.DURATION_TOLERANCE_S
+
 
 @dataclass(frozen=True, slots=True)
 class VideoFingerprint:
@@ -489,6 +548,9 @@ class VideoFingerprint:
     hashes: np.ndarray
     consensus_hash: int
     file_size: int
+    width: int
+    height: int
+
 
 @dataclass(frozen=True, slots=True)
 class EngineCallbacks:
@@ -496,6 +558,7 @@ class EngineCallbacks:
     progress: Callable[[int], None] = _noop
     stage: Callable[[str], None] = _noop
     result: Callable[[dict], None] = _noop
+    status: Callable[[dict], None] = _noop
     should_cancel: Callable[[], bool] = lambda: False
 
 class DedupDatabase:
@@ -506,11 +569,13 @@ class DedupDatabase:
         "mtime_ns",
         "fast_sig",
         "duration",
+        "width",
+        "height",
         "phash_data",
         "consensus_hash",
     }
 
-    def __init__(self, db_path: str | Path, *, commit_every: int = 10):
+    def __init__(self, db_path: str | Path, *, commit_every: int = 100):
         self._db_path = _safe_resolve_path(db_path, strict=False)
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
@@ -548,6 +613,8 @@ class DedupDatabase:
                     mtime_ns INTEGER,
                     fast_sig TEXT,
                     duration REAL NOT NULL,
+                    width INTEGER NOT NULL DEFAULT 0,
+                    height INTEGER NOT NULL DEFAULT 0,
                     phash_data BLOB NOT NULL,
                     consensus_hash TEXT NOT NULL
                 );
@@ -607,11 +674,11 @@ class DedupDatabase:
         file_size: int,
         mtime_ns: int,
         fast_sig: Optional[str],
-    ) -> Optional[tuple[float, np.ndarray, int]]:
+    ) -> Optional[tuple[float, np.ndarray, int, int, int]]:
         try:
             with self._lock:
                 row = self._conn.execute(
-                    "SELECT file_size, mtime_ns, fast_sig, duration, phash_data, consensus_hash FROM video_cache WHERE cache_key = ?",
+                    "SELECT file_size, mtime_ns, fast_sig, duration, width, height, phash_data, consensus_hash FROM video_cache WHERE cache_key = ?",
                     (cache_key,),
                 ).fetchone()
         except sqlite3.Error:
@@ -626,7 +693,7 @@ class DedupDatabase:
         row_fast_sig = row["fast_sig"]
         row_mtime_ns = row["mtime_ns"]
 
-        if fast_sig and row_fast_sig:
+        if fast_sig is not None and row_fast_sig:
             if str(row_fast_sig) != str(fast_sig):
                 return None
         else:
@@ -636,6 +703,8 @@ class DedupDatabase:
         blob = row["phash_data"]
         consensus = row["consensus_hash"]
         duration = row["duration"]
+        width = row["width"]
+        height = row["height"]
         if blob is None or consensus is None or duration is None:
             return None
 
@@ -664,7 +733,13 @@ class DedupDatabase:
                 pass
             return None
 
-        return float(duration), hashes.astype(np.uint64, copy=False), int(consensus_int)
+        return (
+            float(duration),
+            hashes.astype(np.uint64, copy=False),
+            int(consensus_int),
+            int(width or 0),
+            int(height or 0),
+        )
 
     def upsert_fingerprint(
         self,
@@ -675,6 +750,8 @@ class DedupDatabase:
         mtime_ns: int,
         fast_sig: Optional[str],
         duration: float,
+        width: int,
+        height: int,
         hashes: np.ndarray,
         consensus_hash: int,
     ) -> None:
@@ -684,14 +761,16 @@ class DedupDatabase:
         with self._lock:
             self._conn.execute(
                 """
-                INSERT INTO video_cache(cache_key, display_rel_path, file_size, mtime_ns, fast_sig, duration, phash_data, consensus_hash)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO video_cache(cache_key, display_rel_path, file_size, mtime_ns, fast_sig, duration, width, height, phash_data, consensus_hash)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(cache_key) DO UPDATE SET
                     display_rel_path=excluded.display_rel_path,
                     file_size=excluded.file_size,
                     mtime_ns=excluded.mtime_ns,
                     fast_sig=excluded.fast_sig,
                     duration=excluded.duration,
+                    width=excluded.width,
+                    height=excluded.height,
                     phash_data=excluded.phash_data,
                     consensus_hash=excluded.consensus_hash
                 """,
@@ -702,6 +781,8 @@ class DedupDatabase:
                     int(mtime_ns),
                     fast_sig,
                     float(duration),
+                    int(width),
+                    int(height),
                     blob,
                     consensus_hex,
                 ),
@@ -710,6 +791,14 @@ class DedupDatabase:
             if self._pending_writes >= self._commit_every:
                 self._conn.commit()
                 self._pending_writes = 0
+
+    def flush(self) -> None:
+        with self._lock:
+            try:
+                self._conn.commit()
+            except sqlite3.Error:
+                return
+            self._pending_writes = 0
 
     def delete(self, cache_key: str) -> None:
         with self._lock:
@@ -727,6 +816,7 @@ class DedupDatabase:
             try:
                 if self._pending_writes:
                     self._conn.commit()
+                    self._pending_writes = 0
                 self._conn.close()
             except Exception:
                 pass
@@ -747,6 +837,7 @@ class DedupDatabase:
             self._conn.commit()
             self._pending_writes = 0
             return len(stale_keys)
+
 
 class BKTree:
     class _Node:
@@ -859,7 +950,6 @@ def best_time_shift_similarity(
     min_overlap_frames: int,
     early_exit_threshold: float = 0.0,
 ) -> tuple[float, int, int]:
-
     if hashes_a.size == 0 or hashes_b.size == 0:
         return 0.0, 0, 0
 
@@ -869,8 +959,6 @@ def best_time_shift_similarity(
     len_b = int(b.size)
 
     effective_min_overlap = max(1, min(int(min_overlap_frames), len_a, len_b))
-    # Search the exact offset range that can still meet the required overlap. The old coarse pass could
-    # miss the true optimum, and its offset bounds were wrong for unequal-length clips.
     full_range_low = -(len_a - effective_min_overlap)
     full_range_high = len_b - effective_min_overlap
     low = max(full_range_low, -int(max_offset_frames))
@@ -881,7 +969,6 @@ def best_time_shift_similarity(
     best_similarity = -1.0
     best_offset = 0
     best_overlap = 0
-
     max_possible_overlap = min(len_a, len_b)
 
     def eval_offset(offset_frames: int) -> tuple[float, int]:
@@ -897,10 +984,11 @@ def best_time_shift_similarity(
         similarity = 1.0 - (distance_sum / float(Thresholds.PHASH_BITS * overlap))
         return similarity, overlap
 
-    for offset_frames in range(low, high + 1):
+    def record_candidate(offset_frames: int) -> tuple[bool, float, int]:
+        nonlocal best_similarity, best_offset, best_overlap
         similarity, overlap = eval_offset(offset_frames)
         if overlap < effective_min_overlap:
-            continue
+            return False, similarity, overlap
 
         if _is_better_alignment(
             similarity,
@@ -914,16 +1002,73 @@ def best_time_shift_similarity(
             best_offset = offset_frames
             best_overlap = overlap
 
-            if (
-                early_exit_threshold > 0
-                and similarity >= 1.0 - 1e-12
-                and overlap >= max_possible_overlap
-            ):
+        early_exit = (
+            early_exit_threshold > 0
+            and similarity >= 1.0 - 1e-12
+            and overlap >= max_possible_overlap
+        )
+        return early_exit, similarity, overlap
+
+    coarse_step = max(1, int(Thresholds.COARSE_STEP))
+    offset_span = (high - low) + 1
+    use_coarse = coarse_step > 1 and offset_span > int(Thresholds.COARSE_THRESHOLD)
+
+    if not use_coarse:
+        for offset_frames in range(low, high + 1):
+            early_exit, _similarity, _overlap = record_candidate(offset_frames)
+            if early_exit:
                 break
+        if best_similarity < 0:
+            return 0.0, 0, 0
+        return best_similarity, best_offset, best_overlap
+
+    coarse_offsets = list(range(low, high + 1, coarse_step))
+    if coarse_offsets[-1] != high:
+        coarse_offsets.append(high)
+
+    coarse_results: list[tuple[float, int, int]] = []
+    best_coarse_similarity = -1.0
+    for offset_frames in coarse_offsets:
+        early_exit, similarity, overlap = record_candidate(offset_frames)
+        if overlap >= effective_min_overlap:
+            coarse_results.append((similarity, overlap, offset_frames))
+            if similarity > best_coarse_similarity:
+                best_coarse_similarity = similarity
+        if early_exit:
+            return best_similarity, best_offset, best_overlap
+
+    if not coarse_results:
+        return 0.0, 0, 0
+
+    coarse_results.sort(
+        key=lambda item: (item[0], item[1], -abs(int(item[2])), -int(item[2])),
+        reverse=True,
+    )
+
+    selected_offsets = {offset for _sim, _ov, offset in coarse_results[:8]}
+    similarity_margin = 0.06 if best_coarse_similarity < 0.8 else 0.03
+    for similarity, overlap, offset_frames in coarse_results:
+        if similarity >= (best_coarse_similarity - similarity_margin):
+            selected_offsets.add(offset_frames)
+
+    fine_offsets: set[int] = set()
+    for coarse_offset in selected_offsets:
+        fine_low = max(low, int(coarse_offset) - coarse_step)
+        fine_high = min(high, int(coarse_offset) + coarse_step)
+        fine_offsets.update(range(fine_low, fine_high + 1))
+
+    if low <= 0 <= high:
+        fine_offsets.add(0)
+
+    for offset_frames in sorted(fine_offsets):
+        early_exit, _similarity, _overlap = record_candidate(offset_frames)
+        if early_exit:
+            break
 
     if best_similarity < 0:
         return 0.0, 0, 0
     return best_similarity, best_offset, best_overlap
+
 
 def _fingerprint_video_worker(
     video_path: str,
@@ -961,10 +1106,6 @@ def _fingerprint_video_worker(
     video_name = path_obj.name
     on_log(f"[START] Processing: {video_name}")
 
-    if cancel_event.is_set():
-        on_log(f"[DONE] Finished: {video_name} (cancelled)")
-        return {"path": path_str, "ok": False, "cancelled": True}
-
     try:
         stat = path_obj.stat()
         file_size = int(stat.st_size)
@@ -973,15 +1114,46 @@ def _fingerprint_video_worker(
         on_log(f"[DONE] Finished: {video_name} (skipped: stat failed: {exc})")
         return {"path": path_str, "ok": False, "error": f"stat failed: {exc}"}
 
-    fast_sig = _fast_file_signature(path_obj, file_size)
+    width = 0
+    height = 0
+
+    def _failed(message: str, *, cancelled: bool = False) -> dict:
+        payload = {
+            "path": path_str,
+            "ok": False,
+            "error": message,
+            "file_size": file_size,
+            "mtime_ns": mtime_ns,
+            "width": width,
+            "height": height,
+        }
+        if cancelled:
+            payload.pop("error", None)
+            payload["cancelled"] = True
+        return payload
+
+    if cancel_event.is_set():
+        on_log(f"[DONE] Finished: {video_name} (cancelled)")
+        return _failed("cancelled", cancelled=True)
+
     cached = db.get_fingerprint(
         cache_key,
         file_size=file_size,
         mtime_ns=mtime_ns,
-        fast_sig=fast_sig,
+        fast_sig=None,
     )
+    fast_sig: Optional[str] = None
+    if cached is None:
+        fast_sig = _fast_file_signature(path_obj, file_size)
+        cached = db.get_fingerprint(
+            cache_key,
+            file_size=file_size,
+            mtime_ns=mtime_ns,
+            fast_sig=fast_sig,
+        )
+
     if cached is not None:
-        duration_s, hashes_arr, consensus = cached
+        duration_s, hashes_arr, consensus, width, height = cached
         on_log(f"[HASH] Loaded {int(hashes_arr.size)} frames from cache for: {video_name}")
         on_log(f"[DONE] Finished: {video_name} (cached)")
         return {
@@ -993,25 +1165,30 @@ def _fingerprint_video_worker(
             "file_size": file_size,
             "mtime_ns": mtime_ns,
             "cached": True,
+            "width": int(width),
+            "height": int(height),
         }
 
     validator = FFprobeValidator(binaries.ffprobe_path, timeout_s=fingerprint_config.ffprobe_timeout_s)
     meta, err = validator.validate(path_str)
     if meta is None:
         on_log(f"[DONE] Finished: {video_name} (skipped: {err or 'Invalid video'})")
-        return {"path": path_str, "ok": False, "error": err or "Invalid video."}
+        return _failed(err or "Invalid video.")
+
+    width = int(meta.width)
+    height = int(meta.height)
 
     frame_size = int(fingerprint_config.frame_size)
     if frame_size != Thresholds.FRAME_SIZE:
         on_log(f"[DONE] Finished: {video_name} (skipped: frame_size must be {Thresholds.FRAME_SIZE})")
-        return {"path": path_str, "ok": False, "error": f"frame_size must be {Thresholds.FRAME_SIZE}."}
+        return _failed(f"frame_size must be {Thresholds.FRAME_SIZE}.")
     bytes_per_frame = frame_size * frame_size
 
     sample_fps = float(fingerprint_config.sample_fps)
     max_frames = int(fingerprint_config.max_frames)
     if max_frames <= 0:
         on_log(f"[DONE] Finished: {video_name} (skipped: max_frames must be > 0)")
-        return {"path": path_str, "ok": False, "error": "max_frames must be > 0."}
+        return _failed("max_frames must be > 0.")
 
     vf = f"fps={sample_fps},scale={frame_size}:{frame_size}:flags=bicubic,format=gray"
     cmd = [
@@ -1039,6 +1216,7 @@ def _fingerprint_video_worker(
     ]
 
     popen_kwargs = {
+        "stdin": subprocess.DEVNULL,
         "stdout": subprocess.PIPE,
         "stderr": subprocess.PIPE,
     }
@@ -1049,6 +1227,7 @@ def _fingerprint_video_worker(
     hashes: list[int] = []
     stderr_buffer = bytearray()
     stderr_thread: threading.Thread | None = None
+    wait_timed_out = False
 
     try:
         proc = subprocess.Popen(cmd, **popen_kwargs)
@@ -1076,7 +1255,7 @@ def _fingerprint_video_worker(
             if cancel_event.is_set():
                 _kill_chain(proc)
                 on_log(f"[DONE] Finished: {video_name} (cancelled)")
-                return {"path": path_str, "ok": False, "cancelled": True}
+                return _failed("cancelled", cancelled=True)
 
             raw = proc.stdout.read(bytes_per_frame)
             if len(raw) != bytes_per_frame:
@@ -1086,29 +1265,30 @@ def _fingerprint_video_worker(
 
         on_log(f"[HASH] Extracted {len(hashes)} frames for: {video_name}")
 
-        if fingerprint_config.ffmpeg_timeout_s and fingerprint_config.ffmpeg_timeout_s > 0:
-            proc.wait(timeout=fingerprint_config.ffmpeg_timeout_s)
-        else:
-            proc.wait()
+        wait_timeout_s = max(10, int(fingerprint_config.ffmpeg_timeout_s or 0))
+        try:
+            proc.wait(timeout=wait_timeout_s)
+        except subprocess.TimeoutExpired:
+            wait_timed_out = True
+            _kill_chain(proc)
+            on_log(
+                f"[WARN] {_timestamp()} FFmpeg lingered after frame extraction for {video_name}; "
+                f"using {len(hashes)} collected frame(s)."
+            )
 
         if stderr_thread is not None:
             stderr_thread.join(timeout=1.0)
 
         stderr = bytes(stderr_buffer).decode(errors="replace").strip()
-        if proc.returncode != 0:
+        if proc.returncode not in (None, 0) and not wait_timed_out:
             error_message = stderr or f"ffmpeg rc={proc.returncode}"
             on_log(f"[DONE] Finished: {video_name} (failed: {error_message})")
-            return {"path": path_str, "ok": False, "error": error_message}
-    except subprocess.TimeoutExpired:
-        if proc:
-            _kill_chain(proc)
-        on_log(f"[DONE] Finished: {video_name} (failed: ffmpeg timeout)")
-        return {"path": path_str, "ok": False, "error": "ffmpeg timeout."}
+            return _failed(error_message)
     except Exception as exc:
         if proc:
             _kill_chain(proc)
         on_log(f"[DONE] Finished: {video_name} (failed: ffmpeg error)")
-        return {"path": path_str, "ok": False, "error": f"ffmpeg failed: {exc}"}
+        return _failed(f"ffmpeg failed: {exc}")
     finally:
         try:
             if proc:
@@ -1128,7 +1308,7 @@ def _fingerprint_video_worker(
 
     if not hashes:
         on_log(f"[DONE] Finished: {video_name} (failed: no frames extracted)")
-        return {"path": path_str, "ok": False, "error": "No frames extracted."}
+        return _failed("No frames extracted.")
 
     hashes_arr = np.array(hashes, dtype=np.uint64)
     consensus = consensus_hash_uint64(hashes_arr)
@@ -1141,6 +1321,8 @@ def _fingerprint_video_worker(
             mtime_ns=mtime_ns,
             fast_sig=fast_sig,
             duration=duration_s,
+            width=width,
+            height=height,
             hashes=hashes_arr,
             consensus_hash=int(consensus),
         )
@@ -1157,7 +1339,10 @@ def _fingerprint_video_worker(
         "file_size": file_size,
         "mtime_ns": mtime_ns,
         "cached": False,
+        "width": width,
+        "height": height,
     }
+
 
 class VideoDedupEngine:
     def __init__(
@@ -1376,44 +1561,67 @@ class VideoDedupEngine:
     def run_phase_2_duration(self, root_dir: str | Path) -> dict:
         log = self._callbacks.log
         progress = self._callbacks.progress
+        stage = self._callbacks.stage
         should_cancel = self._callbacks.should_cancel
 
         root_path = _safe_resolve_path(root_dir, strict=False)
+        stage("Phase 2: Duration Matching")
+
         cleanup = self._cleanup_group_folders(root_path, "Group_Size_")
         if cleanup.get("cancelled"):
             return {"processed": 0, "groups_created": 0, "files_moved": 0, "trashed_low_res": 0, "cancelled": True}
 
         cleanup2 = self.run_cleanup_low_res(root_path)
         if cleanup2.get("cancelled"):
-            return {"processed": 0, "groups_created": 0, "files_moved": 0, "trashed_low_res": int(cleanup2.get("trashed_low_res") or 0), "cancelled": True}
+            return {
+                "processed": 0,
+                "groups_created": 0,
+                "files_moved": 0,
+                "trashed_low_res": int(cleanup2.get("trashed_low_res") or 0),
+                "cancelled": True,
+            }
+
         duration_items = list(cleanup2.get("duration_items") or [])
         trashed_low_res = int(cleanup2.get("trashed_low_res") or 0)
         if not duration_items:
             progress(0)
             log(f"[INFO] {_timestamp()} Phase 2: no eligible videos found after cleanup.")
-            return {"processed": 0, "groups_created": 0, "files_moved": 0, "trashed_low_res": trashed_low_res, "cancelled": False}
+            return {
+                "processed": 0,
+                "groups_created": 0,
+                "files_moved": 0,
+                "trashed_low_res": trashed_low_res,
+                "cancelled": False,
+            }
 
-        duration_items.sort(key=lambda t: t[0])
-        tolerance = Thresholds.DURATION_TOLERANCE_S
+        duration_items.sort(key=lambda item: item[0])
+        tolerance = max(0.0, float(self._config.duration_tolerance_s))
+        log(f"[INFO] {_timestamp()} Phase 2: grouping durations with tolerance <= {tolerance:.2f}s.")
 
         clusters: list[list[tuple[float, Path]]] = []
+        current_cluster: list[tuple[float, Path]] = []
+        previous_duration: float | None = None
         for item in duration_items:
-            if not clusters:
-                clusters.append([item])
+            duration_s, _path = item
+            if not current_cluster:
+                current_cluster = [item]
+                previous_duration = duration_s
                 continue
-            current = clusters[-1]
-            durs = [duration for duration, _path in current]
-            new_min = min(min(durs), item[0])
-            new_max = max(max(durs), item[0])
-            if (new_max - new_min) < tolerance:
-                current.append(item)
-            else:
-                clusters.append([item])
 
-        duplicate_clusters = [c for c in clusters if len(c) > 1]
+            if previous_duration is not None and (duration_s - previous_duration) <= tolerance:
+                current_cluster.append(item)
+            else:
+                clusters.append(current_cluster)
+                current_cluster = [item]
+            previous_duration = duration_s
+
+        if current_cluster:
+            clusters.append(current_cluster)
+
+        duplicate_clusters = [cluster for cluster in clusters if len(cluster) > 1]
         groups_created = 0
         files_moved = 0
-        total_to_move = sum(len(c) for c in duplicate_clusters)
+        total_to_move = sum(len(cluster) for cluster in duplicate_clusters)
         moved_so_far = 0
         progress(0)
 
@@ -1465,27 +1673,65 @@ class VideoDedupEngine:
         }
 
     def run_phase_3_prepare(self, root_dir: str | Path) -> dict:
-        root_path = _safe_resolve_path(root_dir, strict=False)
-        return self._cleanup_group_folders(root_path, "Group_Time_")
+        log = self._callbacks.log
+        stage = self._callbacks.stage
 
-    def run_phase_3_content(self, root_dir: str | Path) -> dict:
+        root_path = _safe_resolve_path(root_dir, strict=False)
+        stage("Phase 3 Prep")
+        cleanup = self._cleanup_group_folders(root_path, "Group_Time_")
+        if cleanup.get("cancelled"):
+            return {**cleanup, "prepared_videos": []}
+
+        prepared_videos = [str(path) for path in self._list_videos_in_root(root_path)]
+        log(
+            f"[INFO] {_timestamp()} Phase 3 prepare: prepared {len(prepared_videos)} video(s) "
+            "for content comparison."
+        )
+        return {**cleanup, "prepared_videos": prepared_videos}
+
+    def run_phase_3_content(self, root_dir: str | Path, *, video_paths: Optional[list[str | Path]] = None) -> dict:
         log = self._callbacks.log
         progress = self._callbacks.progress
         stage = self._callbacks.stage
         on_result = self._callbacks.result
+        on_status = self._callbacks.status
         should_cancel = self._callbacks.should_cancel
 
         root_path = _safe_resolve_path(root_dir, strict=False)
         db: DedupDatabase | None = None
         try:
-            stage("Hashing/Loading")
+            stage("Hashing")
             log(f"[INFO] {_timestamp()} Phase 3: Loading fingerprints (cache/ffmpeg)...")
-            scanner = VideoScanner(on_log=log)
-            video_paths = scanner.scan(root_path)
-            video_records = [(p, *_make_cache_identity(root_path, p)) for p in video_paths]
+
+            if video_paths is None:
+                scanner = VideoScanner(on_log=log)
+                source_paths = scanner.scan(root_path)
+            else:
+                source_paths = []
+                seen_paths: set[str] = set()
+                for candidate in video_paths:
+                    resolved = _safe_resolve_path(candidate, strict=False)
+                    resolved_str = str(resolved)
+                    key = _normalized_text(resolved_str).casefold()
+                    if key in seen_paths:
+                        continue
+                    seen_paths.add(key)
+                    if not _safe_is_file(resolved):
+                        continue
+                    if resolved.suffix.lower() not in VIDEO_EXTENSIONS:
+                        continue
+                    source_paths.append(resolved)
+                source_paths.sort(key=_path_sort_key)
+                log(
+                    f"[INFO] {_timestamp()} Phase 3: Using provided prepared video list "
+                    f"({len(source_paths)} item(s)); skipping directory rescan."
+                )
+
+            video_records = [(p, *_make_cache_identity(root_path, p)) for p in source_paths]
             total_videos = len(video_records)
             if total_videos == 0:
                 progress(0)
+                on_status({"stage": "Hashing", "total": 0, "completed": 0, "current_file": ""})
                 log(f"[INFO] {_timestamp()} Phase 3: Nothing to do.")
                 return {"processed": 0, "duplicates": 0, "cancelled": False}
 
@@ -1505,6 +1751,7 @@ class VideoDedupEngine:
             cancelling = False
             completed = 0
             progress(0)
+            on_status({"stage": "Hashing", "total": total_videos, "completed": 0, "current_file": ""})
 
             def log_error_for(path_str: str, error: str) -> None:
                 log(f"[WARN] {_timestamp()} Skipping: {path_str} ({error})")
@@ -1517,6 +1764,14 @@ class VideoDedupEngine:
                     path, cache_key, display_rel_path = next(path_iter)
                 except StopIteration:
                     return False
+                on_status(
+                    {
+                        "stage": "Hashing",
+                        "total": total_videos,
+                        "completed": completed,
+                        "current_file": path.name,
+                    }
+                )
                 fut = executor.submit(
                     _fingerprint_video_worker,
                     str(path),
@@ -1547,6 +1802,7 @@ class VideoDedupEngine:
                     for fut in done:
                         completed += 1
                         progress(int((completed / total_videos) * 100))
+                        on_status({"stage": "Hashing", "total": total_videos, "completed": completed})
 
                         if cancelling:
                             continue
@@ -1574,6 +1830,8 @@ class VideoDedupEngine:
                                 hashes=result["hashes"],
                                 consensus_hash=int(result["consensus"]),
                                 file_size=int(result.get("file_size") or 0),
+                                width=int(result.get("width") or 0),
+                                height=int(result.get("height") or 0),
                             )
                         )
 
@@ -1581,35 +1839,56 @@ class VideoDedupEngine:
                         if not submit_next(executor):
                             break
 
+            if db is not None:
+                db.flush()
+
             if cancelling:
                 log(f"[INFO] {_timestamp()} Cancelled.")
                 return {"processed": len(fingerprints), "duplicates": 0, "cancelled": True}
 
             if not fingerprints:
                 progress(100)
+                on_status({"stage": "Hashing", "total": total_videos, "completed": total_videos, "current_file": ""})
                 log(f"[INFO] {_timestamp()} Phase 3: No valid videos to compare.")
                 return {"processed": 0, "duplicates": 0, "cancelled": False}
 
-            stage("Indexing/Comparing")
+            stage("Comparing")
+            progress(0)
+            on_status({"stage": "Comparing", "total": len(fingerprints), "completed": 0, "current_file": ""})
+
             base_max_hamming = _prefilter_hamming_radius(
                 float(match_config.consensus_prefilter_similarity),
                 frame_count=max(int(fp.hashes.size) for fp in fingerprints),
+                min_radius=int(match_config.consensus_min_hamming_radius),
             )
-            log(f"[INFO] {_timestamp()} Phase 3: BK-Tree prefilter <= {base_max_hamming} bit(s) (loose consensus gate)")
-            log(f"[INFO] {_timestamp()} Phase 3: Exact offset search across BK-Tree candidates...")
-            progress(0)
+            log(
+                f"[INFO] {_timestamp()} Phase 3: BK-Tree prefilter <= {base_max_hamming} bit(s) "
+                "(consensus-hash loose gate)"
+            )
+            log(f"[INFO] {_timestamp()} Phase 3: Coarse-to-fine offset search across BK-Tree candidates...")
             tree = BKTree(hamming_distance_uint64_scalar)
             duplicates_found = 0
             comparisons_run = 0
+            reported_pairs: set[tuple[str, str]] = set()
 
             for i, fp in enumerate(fingerprints):
                 if should_cancel():
                     cancelling = True
                     break
 
+                on_status(
+                    {
+                        "stage": "Comparing",
+                        "total": len(fingerprints),
+                        "completed": i,
+                        "current_file": Path(fp.path).name,
+                    }
+                )
+
                 max_hamming = _prefilter_hamming_radius(
                     float(match_config.consensus_prefilter_similarity),
                     frame_count=int(fp.hashes.size),
+                    min_radius=int(match_config.consensus_min_hamming_radius),
                 )
                 neighbors = tree.query(fp.consensus_hash, max_hamming)
                 for j in neighbors:
@@ -1634,12 +1913,32 @@ class VideoDedupEngine:
                         int(overlap_frames),
                     )
                     if similarity >= required_similarity:
+                        pair_key = tuple(
+                            sorted(
+                                (
+                                    _normalized_text(other.path).casefold(),
+                                    _normalized_text(fp.path).casefold(),
+                                )
+                            )
+                        )
+                        if pair_key in reported_pairs:
+                            continue
+                        reported_pairs.add(pair_key)
+
                         duplicates_found += 1
                         offset_s = offset_frames / fp_config.sample_fps if fp_config.sample_fps else 0.0
                         on_result(
                             {
                                 "original": other.path,
                                 "duplicate": fp.path,
+                                "original_size": int(other.file_size),
+                                "duplicate_size": int(fp.file_size),
+                                "original_duration_s": float(other.duration_s),
+                                "duplicate_duration_s": float(fp.duration_s),
+                                "original_width": int(other.width),
+                                "original_height": int(other.height),
+                                "duplicate_width": int(fp.width),
+                                "duplicate_height": int(fp.height),
                                 "similarity": float(similarity * 100.0),
                                 "offset_s": float(offset_s),
                                 "overlap_frames": int(overlap_frames),
@@ -1651,12 +1950,27 @@ class VideoDedupEngine:
                 tree.add(fp.consensus_hash, i)
                 if i % Thresholds.PROGRESS_INTERVAL == 0 or i == len(fingerprints) - 1:
                     progress(int(((i + 1) / len(fingerprints)) * 100))
+                on_status(
+                    {
+                        "stage": "Comparing",
+                        "total": len(fingerprints),
+                        "completed": i + 1,
+                    }
+                )
 
             if cancelling:
                 log(f"[INFO] {_timestamp()} Cancelled.")
                 return {"processed": len(fingerprints), "duplicates": duplicates_found, "cancelled": True}
 
             progress(100)
+            on_status(
+                {
+                    "stage": "Comparing",
+                    "total": len(fingerprints),
+                    "completed": len(fingerprints),
+                    "current_file": "",
+                }
+            )
             log(
                 f"[INFO] {_timestamp()} Done. Processed {len(fingerprints)} valid video(s). "
                 f"Compared {comparisons_run} pair(s)."
@@ -1676,12 +1990,15 @@ class VideoDedupEngine:
     def run(self, root_dir: str | Path) -> dict:
         return self.run_phase_3_content(root_dir)
 
+
 def run_gui(binaries: FFmpegBinaries) -> int:
-    from PyQt5.QtCore import QThread, QTimer, Qt, pyqtSignal
-    from PyQt5.QtGui import QBrush, QColor, QDesktopServices, QFont, QTextCursor
+    from PyQt5.QtCore import QSettings, QThread, QTimer, Qt, pyqtSignal
+    from PyQt5.QtGui import QBrush, QColor, QDesktopServices, QFont, QKeySequence, QPalette, QTextCursor
     from PyQt5.QtWidgets import (
         QApplication,
         QCheckBox,
+        QComboBox,
+        QDoubleSpinBox,
         QFileDialog,
         QHBoxLayout,
         QHeaderView,
@@ -1690,10 +2007,12 @@ def run_gui(binaries: FFmpegBinaries) -> int:
         QMainWindow,
         QMenu,
         QMessageBox,
+        QProgressBar,
         QProgressDialog,
         QPushButton,
-        QProgressBar,
+        QShortcut,
         QSpinBox,
+        QSplitter,
         QTableWidget,
         QTableWidgetItem,
         QTextEdit,
@@ -1707,20 +2026,56 @@ def run_gui(binaries: FFmpegBinaries) -> int:
     PHASE_TIME = 2
     PHASE_CONTENT = 3
 
+    SCAN_MODE_FULL = "full"
+    SCAN_MODE_QUICK = "quick"
+    SCAN_MODE_SIZE_ONLY = "size_only"
+    SCAN_MODE_DURATION_ONLY = "duration_only"
+
+    PATH_ROLE = Qt.UserRole
+    SORT_ROLE = Qt.UserRole + 1
+    PAYLOAD_ROLE = Qt.UserRole + 2
+
+    class SortableTableWidgetItem(QTableWidgetItem):
+        def __lt__(self, other) -> bool:
+            if isinstance(other, QTableWidgetItem):
+                left = self.data(SORT_ROLE)
+                right = other.data(SORT_ROLE)
+                if left is not None and right is not None:
+                    try:
+                        return left < right
+                    except Exception:
+                        try:
+                            return float(left) < float(right)
+                        except Exception:
+                            pass
+            return super().__lt__(other)
+
     class WorkerThread(QThread):
         signal_log = pyqtSignal(str)
         signal_progress = pyqtSignal(int)
         signal_stage = pyqtSignal(str)
+        signal_status = pyqtSignal(dict)
         signal_result = pyqtSignal(dict)
         signal_done = pyqtSignal(str, dict)
         signal_finished = pyqtSignal()
 
-        def __init__(self, task: str, root_dir: str, binaries: FFmpegBinaries, max_threads: int, parent=None):
+        def __init__(
+            self,
+            task: str,
+            root_dir: str,
+            binaries: FFmpegBinaries,
+            max_threads: int,
+            duration_tolerance_s: float,
+            prepared_video_paths: Optional[list[str]] = None,
+            parent=None,
+        ):
             super().__init__(parent)
             self._task = str(task)
             self._root_dir = root_dir
             self._binaries = binaries
             self._max_threads = int(max_threads)
+            self._duration_tolerance_s = float(duration_tolerance_s)
+            self._prepared_video_paths = list(prepared_video_paths or [])
             self._cancel_event = threading.Event()
 
         def request_cancel(self) -> None:
@@ -1743,32 +2098,47 @@ def run_gui(binaries: FFmpegBinaries) -> int:
                 progress=self.signal_progress.emit,
                 stage=self.signal_stage.emit,
                 result=self.signal_result.emit,
+                status=self.signal_status.emit,
                 should_cancel=self._should_cancel,
             )
-            config = EngineConfig(max_threads=max(1, min(16, self._max_threads)))
+            config = EngineConfig(
+                max_threads=max(1, min(16, self._max_threads)),
+                duration_tolerance_s=max(0.0, self._duration_tolerance_s),
+            )
             engine = VideoDedupEngine(self._binaries, config=config, callbacks=callbacks)
+
             if self._task == "phase1_size":
+                self.signal_stage.emit("Phase 1: Size Matching")
                 summary = engine.run_phase_1_size(self._root_dir)
             elif self._task == "phase2_time":
+                self.signal_stage.emit("Phase 2: Duration Matching")
                 summary = engine.run_phase_2_duration(self._root_dir)
             elif self._task == "phase3_prepare":
+                self.signal_stage.emit("Phase 3 Prep")
                 summary = engine.run_phase_3_prepare(self._root_dir)
             elif self._task == "phase3_direct":
+                self.signal_stage.emit("Cleanup")
                 self._log(
-                    f"[INFO] Checkbox enabled: Running pre-scan cleanup for <{Thresholds.MIN_RESOLUTION_PX}px videos..."
+                    f"[INFO] {_timestamp()} Quick scan: running pre-scan cleanup for <{Thresholds.MIN_RESOLUTION_PX}px videos..."
                 )
                 cleanup = engine.run_cleanup_low_res(Path(self._root_dir))
+                kept_paths = [str(path) for _duration, path in (cleanup.get("duration_items") or [])]
                 if cleanup.get("cancelled"):
                     summary = {"cancelled": True, "error": "Cancelled during cleanup.", **cleanup}
                 else:
-                    self._log("[INFO] Cleanup done. Moving low-res files to Trash.")
-                    summary = engine.run_phase_3_content(self._root_dir)
+                    self._log("[INFO] Cleanup done. Continuing with content scan using the prepared file list.")
+                    summary = engine.run_phase_3_content(self._root_dir, video_paths=kept_paths)
                     summary = {
                         **summary,
                         "trashed_low_res_precleanup": int(cleanup.get("trashed_low_res") or 0),
+                        "prepared_videos": kept_paths,
                     }
             elif self._task == "phase3_content":
-                summary = engine.run_phase_3_content(self._root_dir)
+                self.signal_stage.emit("Hashing")
+                summary = engine.run_phase_3_content(
+                    self._root_dir,
+                    video_paths=self._prepared_video_paths or None,
+                )
             else:
                 summary = {"cancelled": True, "error": f"Unknown task: {self._task}"}
 
@@ -1780,63 +2150,112 @@ def run_gui(binaries: FFmpegBinaries) -> int:
             super().__init__()
             self._binaries = binaries
             self._worker: WorkerThread | None = None
+            self._settings = QSettings("VideoDedupTool", "Deduplicator")
+            self._prepared_phase3_videos: list[str] = []
+            self._scan_started_at: float | None = None
+            self._stage_started_at: float | None = None
+            self._status_info: dict[str, object] = {"stage": "Idle", "total": 0, "completed": 0, "current_file": ""}
+            self._log_entries: list[tuple[str, str]] = []
+            self._selected_delete_paths: set[str] = set()
             self.current_phase = PHASE_IDLE
             self._active_task: str | None = None
             self._root_dir: str | None = None
+            self._scan_mode = SCAN_MODE_FULL
 
-            self.setWindowTitle("Advanced Video Deduplicator")
-            self.setMinimumSize(1100, 700)
+            self.setWindowTitle("Video Deduplicator v1.0")
+            self.setMinimumSize(1280, 780)
+            self.setAcceptDrops(True)
+
+            palette = QApplication.instance().palette()
+            self._dark_mode = palette.color(QPalette.Window).lightness() < 128
+            self._conflict_brush = QBrush(QColor(120, 50, 50) if self._dark_mode else QColor(255, 220, 220))
+            self._resolved_brush = QBrush(QColor(50, 120, 50) if self._dark_mode else QColor(220, 255, 220))
+            self._delete_selection_brush = QBrush(QColor(140, 60, 60) if self._dark_mode else QColor(255, 185, 185))
+            self._delete_selection_foreground = QBrush(QColor(255, 255, 255) if self._dark_mode else QColor(120, 0, 0))
 
             central = QWidget(self)
             self.setCentralWidget(central)
 
+            last_folder = str(self._settings.value("last_folder", os.getcwd()) or os.getcwd())
+
             self.path_edit = QLineEdit()
             self.path_edit.setPlaceholderText("Select a folder to scan...")
+            self.path_edit.setText(last_folder)
+
             self.browse_button = QPushButton("Browse...")
             self.start_button = QPushButton("Start Scan")
+            self.start_button.setDefault(True)
             self.continue_button = QPushButton("Continue")
             self.continue_button.setEnabled(False)
             self.continue_button.setVisible(False)
             self.stop_button = QPushButton("Stop/Cancel")
             self.stop_button.setEnabled(False)
+
+            self.scan_mode_combo = QComboBox()
+            self.scan_mode_combo.addItem("Full Scan (Size → Duration → Content)", SCAN_MODE_FULL)
+            self.scan_mode_combo.addItem("Quick Scan (Content Only)", SCAN_MODE_QUICK)
+            self.scan_mode_combo.addItem("Size Match Only", SCAN_MODE_SIZE_ONLY)
+            self.scan_mode_combo.addItem("Duration Match Only", SCAN_MODE_DURATION_ONLY)
+            self.scan_mode_combo.setCurrentIndex(0)
+
             self.max_threads_spin = QSpinBox()
             self.max_threads_spin.setRange(1, 16)
-            self.max_threads_spin.setValue(3)
+            self.max_threads_spin.setValue(min(os.cpu_count() or 4, 6))
             self.max_threads_spin.setToolTip("Limit concurrent FFmpeg workers to reduce CPU/Disk pressure.")
-            self.skip_filters_checkbox = QCheckBox("Skip Size/Time Filters (Direct Phase 3)")
-            self.skip_filters_checkbox.setChecked(False)
 
-            input_row = QHBoxLayout()
-            input_row.addWidget(QLabel("Folder:"))
-            input_row.addWidget(self.path_edit, 1)
-            input_row.addWidget(self.browse_button)
-
-            control_row = QHBoxLayout()
-            control_row.addWidget(self.start_button)
-            control_row.addWidget(self.continue_button)
-            control_row.addWidget(self.stop_button)
-            control_row.addWidget(QLabel("Max Threads:"))
-            control_row.addWidget(self.max_threads_spin)
-            control_row.addWidget(self.skip_filters_checkbox)
-            control_row.addStretch(1)
+            self.duration_tolerance_spin = QDoubleSpinBox()
+            self.duration_tolerance_spin.setRange(0.1, 10.0)
+            self.duration_tolerance_spin.setDecimals(1)
+            self.duration_tolerance_spin.setSingleStep(0.1)
+            self.duration_tolerance_spin.setValue(Thresholds.DURATION_TOLERANCE_S)
+            self.duration_tolerance_spin.setSuffix(" s")
+            self.duration_tolerance_spin.setToolTip("Duration tolerance used for Phase 2 grouping.")
 
             self.progress_bar = QProgressBar()
             self.progress_bar.setRange(0, 100)
             self.progress_bar.setValue(0)
             self.stage_label = QLabel("Stage: Idle")
 
+            self.clear_log_button = QPushButton("Clear Log")
+            self.save_log_button = QPushButton("Save Log")
+            self.info_checkbox = QCheckBox("INFO")
+            self.warn_checkbox = QCheckBox("WARN")
+            self.error_checkbox = QCheckBox("ERROR")
+            for checkbox in (self.info_checkbox, self.warn_checkbox, self.error_checkbox):
+                checkbox.setChecked(True)
+
             self.log_box = QTextEdit()
             self.log_box.setReadOnly(True)
             self.log_box.setFont(QFont("Consolas", 10))
 
-            self.results_table = QTableWidget(0, 4)
-            self.results_table.setHorizontalHeaderLabels(
-                ["Original File", "Duplicate File", "Similarity %", "Time Offset"]
-            )
+            self.export_button = QPushButton("Export Results")
+            self.export_button.setEnabled(False)
+            self.auto_select_smaller_button = QPushButton("Auto-select duplicates (keep larger)")
+            self.auto_select_smaller_button.setEnabled(False)
+            self.auto_select_lower_res_button = QPushButton("Auto-select duplicates (keep higher-res)")
+            self.auto_select_lower_res_button.setEnabled(False)
+            self.delete_selected_button = QPushButton("Delete Selected")
+            self.delete_selected_button.setEnabled(False)
+
+            headers = [
+                "Original File",
+                "Duplicate File",
+                "Original Size",
+                "Duplicate Size",
+                "Original Duration",
+                "Duplicate Duration",
+                "Similarity %",
+                "Time Offset",
+            ]
+            self.results_table = QTableWidget(0, len(headers))
+            self.results_table.setHorizontalHeaderLabels(headers)
             self.results_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
             self.results_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
-            self.results_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
-            self.results_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+            for col in range(2, len(headers)):
+                self.results_table.horizontalHeader().setSectionResizeMode(col, QHeaderView.ResizeToContents)
+            self.results_table.horizontalHeader().setMinimumSectionSize(90)
+            self.results_table.setColumnWidth(0, 320)
+            self.results_table.setColumnWidth(1, 320)
             self.results_table.setAlternatingRowColors(True)
             self.results_table.setSortingEnabled(False)
             self.results_table.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -1848,39 +2267,214 @@ def run_gui(binaries: FFmpegBinaries) -> int:
             self._refresh_timer.timeout.connect(self._refresh_table_state)
             self._refresh_timer.start()
 
+            input_row = QHBoxLayout()
+            input_row.addWidget(QLabel("Folder:"))
+            input_row.addWidget(self.path_edit, 1)
+            input_row.addWidget(self.browse_button)
+
+            control_row = QHBoxLayout()
+            control_row.addWidget(self.start_button)
+            control_row.addWidget(self.continue_button)
+            control_row.addWidget(self.stop_button)
+            control_row.addSpacing(12)
+            control_row.addWidget(QLabel("Scan Mode:"))
+            control_row.addWidget(self.scan_mode_combo)
+            control_row.addWidget(QLabel("Max Threads:"))
+            control_row.addWidget(self.max_threads_spin)
+            control_row.addWidget(QLabel("Duration Tolerance:"))
+            control_row.addWidget(self.duration_tolerance_spin)
+            control_row.addStretch(1)
+
+            log_controls = QHBoxLayout()
+            log_controls.addWidget(QLabel("Logs:"))
+            log_controls.addWidget(self.clear_log_button)
+            log_controls.addWidget(self.save_log_button)
+            log_controls.addSpacing(12)
+            log_controls.addWidget(self.info_checkbox)
+            log_controls.addWidget(self.warn_checkbox)
+            log_controls.addWidget(self.error_checkbox)
+            log_controls.addStretch(1)
+
+            log_panel = QWidget()
+            log_layout = QVBoxLayout(log_panel)
+            log_layout.setContentsMargins(0, 0, 0, 0)
+            log_layout.addLayout(log_controls)
+            log_layout.addWidget(self.log_box)
+
+            result_controls = QHBoxLayout()
+            result_controls.addWidget(QLabel("Results:"))
+            result_controls.addWidget(self.export_button)
+            result_controls.addWidget(self.auto_select_smaller_button)
+            result_controls.addWidget(self.auto_select_lower_res_button)
+            result_controls.addWidget(self.delete_selected_button)
+            result_controls.addStretch(1)
+
+            results_panel = QWidget()
+            results_layout = QVBoxLayout(results_panel)
+            results_layout.setContentsMargins(0, 0, 0, 0)
+            results_layout.addLayout(result_controls)
+            results_layout.addWidget(self.results_table)
+
+            splitter = QSplitter(Qt.Vertical)
+            splitter.addWidget(log_panel)
+            splitter.addWidget(results_panel)
+            splitter.setStretchFactor(0, 2)
+            splitter.setStretchFactor(1, 3)
+
             layout = QVBoxLayout()
             layout.addLayout(input_row)
             layout.addLayout(control_row)
             layout.addWidget(self.stage_label)
             layout.addWidget(self.progress_bar)
-            layout.addWidget(QLabel("Logs:"))
-            layout.addWidget(self.log_box, 2)
-            layout.addWidget(QLabel("Results:"))
-            layout.addWidget(self.results_table, 3)
+            layout.addWidget(splitter, 1)
             central.setLayout(layout)
+
+            self.summary_label = QLabel("Summary: —")
+            self.statusBar().addPermanentWidget(self.summary_label, 1)
 
             self.browse_button.clicked.connect(self._on_browse)
             self.start_button.clicked.connect(self._on_start)
             self.continue_button.clicked.connect(self._on_continue)
             self.stop_button.clicked.connect(self._on_stop)
+            self.clear_log_button.clicked.connect(self._clear_log)
+            self.save_log_button.clicked.connect(self._save_log)
+            self.info_checkbox.toggled.connect(self._rebuild_log_view)
+            self.warn_checkbox.toggled.connect(self._rebuild_log_view)
+            self.error_checkbox.toggled.connect(self._rebuild_log_view)
+            self.export_button.clicked.connect(self._export_results_to_csv)
+            self.auto_select_smaller_button.clicked.connect(self._auto_select_keep_larger)
+            self.auto_select_lower_res_button.clicked.connect(self._auto_select_keep_higher_res)
+            self.delete_selected_button.clicked.connect(self._delete_selected_files)
 
-            default_dir = _safe_resolve_path(os.getcwd(), strict=False)
-            self.path_edit.setText(str(default_dir))
+            QShortcut(QKeySequence("Ctrl+O"), self, activated=self._on_browse)
+            QShortcut(QKeySequence("Return"), self, activated=self._on_primary_action_shortcut)
+            QShortcut(QKeySequence("Enter"), self, activated=self._on_primary_action_shortcut)
+            QShortcut(QKeySequence("Ctrl+Return"), self, activated=self._on_start)
+            QShortcut(QKeySequence("Ctrl+Enter"), self, activated=self._on_start)
+            QShortcut(QKeySequence("Escape"), self, activated=self._on_stop)
+            QShortcut(QKeySequence("Delete"), self.results_table, activated=self._delete_current_selected_file)
+            QShortcut(QKeySequence("Ctrl+E"), self, activated=self._export_results_to_csv)
+
+        def _on_primary_action_shortcut(self) -> None:
+            if self.current_phase == PHASE_IDLE:
+                self._on_start()
+            elif self.continue_button.isVisible() and self.continue_button.isEnabled():
+                self._on_continue()
+
+        def dragEnterEvent(self, event) -> None:
+            mime = event.mimeData()
+            if mime is not None and mime.hasUrls():
+                for url in mime.urls():
+                    local = url.toLocalFile()
+                    if local and Path(local).is_dir():
+                        event.acceptProposedAction()
+                        return
+            event.ignore()
+
+        def dropEvent(self, event) -> None:
+            mime = event.mimeData()
+            if mime is None or not mime.hasUrls():
+                event.ignore()
+                return
+            for url in mime.urls():
+                local = url.toLocalFile()
+                if local and Path(local).is_dir():
+                    self.path_edit.setText(local)
+                    self.statusBar().showMessage(f"Folder set from drag-and-drop: {local}", 4000)
+                    event.acceptProposedAction()
+                    return
+            event.ignore()
+
+        def _classify_log_level(self, message: str) -> str:
+            text_upper = str(message).upper()
+            if "[ERROR]" in text_upper:
+                return "ERROR"
+            if "[WARN]" in text_upper:
+                return "WARN"
+            if "[DONE]" in text_upper:
+                return "DONE"
+            return "INFO"
+
+        def _is_log_visible(self, level: str) -> bool:
+            if level == "ERROR":
+                return self.error_checkbox.isChecked()
+            if level == "WARN":
+                return self.warn_checkbox.isChecked()
+            return self.info_checkbox.isChecked()
+
+        def _log_color(self, level: str) -> str:
+            if level == "ERROR":
+                return "#ff6b6b" if self._dark_mode else "#b00020"
+            if level == "WARN":
+                return "#ffb454" if self._dark_mode else "#c56a00"
+            if level == "DONE":
+                return "#6fdc8c" if self._dark_mode else "#0a7f2e"
+            return "#d0d0d0" if self._dark_mode else "#202020"
+
+        def _render_log_entry_html(self, level: str, message: str) -> str:
+            escaped = html.escape(message).replace("\n", "<br>")
+            color = self._log_color(level)
+            return f'<span style="color:{color}; white-space:pre-wrap;">{escaped}</span>'
 
         def _append_log(self, message: str) -> None:
-            self.log_box.append(message)
+            level = self._classify_log_level(message)
+            self._log_entries.append((level, message))
+            if not self._is_log_visible(level):
+                return
+            self.log_box.moveCursor(QTextCursor.End)
+            self.log_box.insertHtml(self._render_log_entry_html(level, message) + "<br>")
             self.log_box.moveCursor(QTextCursor.End)
             self.log_box.ensureCursorVisible()
 
+        def _rebuild_log_view(self) -> None:
+            fragments = [
+                self._render_log_entry_html(level, message)
+                for level, message in self._log_entries
+                if self._is_log_visible(level)
+            ]
+            self.log_box.setHtml("<br>".join(fragments))
+            self.log_box.moveCursor(QTextCursor.End)
+            self.log_box.ensureCursorVisible()
+
+        def _clear_log(self) -> None:
+            self._log_entries.clear()
+            self.log_box.clear()
+            self.statusBar().showMessage("Log cleared.", 3000)
+
+        def _save_log(self) -> None:
+            default_name = f"video_deduplicator_log_{time.strftime('%Y%m%d_%H%M%S')}.txt"
+            chosen, _ = QFileDialog.getSaveFileName(
+                self,
+                "Save Log",
+                str(_safe_resolve_path(default_name, strict=False)),
+                "Text Files (*.txt);;All Files (*)",
+            )
+            if not chosen:
+                return
+            try:
+                with open(chosen, "w", encoding="utf-8") as handle:
+                    handle.write("\n".join(message for _level, message in self._log_entries))
+                self.statusBar().showMessage(f"Log saved: {chosen}", 5000)
+            except Exception as exc:
+                QMessageBox.warning(self, "Save failed", f"Could not save log:\n\n{chosen}\n\n{exc}")
+
         def _on_browse(self) -> None:
-            chosen = QFileDialog.getExistingDirectory(self, "Select Folder", self.path_edit.text().strip() or os.getcwd())
+            chosen = QFileDialog.getExistingDirectory(
+                self,
+                "Select Folder",
+                self.path_edit.text().strip() or os.getcwd(),
+            )
             if chosen:
                 self.path_edit.setText(chosen)
+
+        def _selected_scan_mode(self) -> str:
+            return str(self.scan_mode_combo.currentData() or SCAN_MODE_FULL)
 
         def _on_start(self) -> None:
             if self.current_phase != PHASE_IDLE:
                 QMessageBox.information(self, "Workflow in progress", "Finish the current workflow or cancel it first.")
                 return
+
             root_dir = self.path_edit.text().strip()
             if not root_dir:
                 QMessageBox.warning(self, "Missing folder", "Please choose a folder to scan.")
@@ -1889,12 +2483,26 @@ def run_gui(binaries: FFmpegBinaries) -> int:
                 QMessageBox.warning(self, "Invalid folder", "Selected folder does not exist.")
                 return
 
+            self._settings.setValue("last_folder", root_dir)
+            self._scan_started_at = time.time()
+            self._stage_started_at = self._scan_started_at
+            self._prepared_phase3_videos = []
+            self._selected_delete_paths.clear()
+            self._status_info = {"stage": "Starting", "total": 0, "completed": 0, "current_file": ""}
+            self._scan_mode = self._selected_scan_mode()
+
+            self.continue_button.setVisible(False)
+            self.continue_button.setEnabled(False)
+            self.results_table.setSortingEnabled(False)
             self.results_table.setRowCount(0)
+            self._log_entries.clear()
             self.log_box.clear()
             self.progress_bar.setValue(0)
+            self.summary_label.setText("Summary: —")
+            self._update_result_action_states()
 
             self._root_dir = root_dir
-            if self.skip_filters_checkbox.isChecked():
+            if self._scan_mode == SCAN_MODE_QUICK:
                 self.current_phase = PHASE_CONTENT
                 self.continue_button.setEnabled(False)
                 self.continue_button.setVisible(False)
@@ -1908,26 +2516,39 @@ def run_gui(binaries: FFmpegBinaries) -> int:
                 return
             if not self._root_dir:
                 return
-            if self.current_phase == PHASE_SIZE:
-                self.current_phase = PHASE_TIME
-                self._start_task("phase2_time")
-            elif self.current_phase == PHASE_TIME:
-                self._start_task("phase3_prepare")
-            elif self.current_phase == PHASE_CONTENT:
-                return
 
-        def _start_task(self, task: str) -> None:
+            if self.current_phase == PHASE_SIZE:
+                if self._scan_mode in {SCAN_MODE_FULL, SCAN_MODE_DURATION_ONLY}:
+                    self.current_phase = PHASE_TIME
+                    self._start_task("phase2_time")
+            elif self.current_phase == PHASE_TIME and self._scan_mode == SCAN_MODE_FULL:
+                self._start_task("phase3_prepare")
+
+        def _start_task(self, task: str, prepared_video_paths: Optional[list[str]] = None) -> None:
             self._active_task = task
             self.start_button.setEnabled(False)
+            self.browse_button.setEnabled(False)
+            self.scan_mode_combo.setEnabled(False)
+            self.max_threads_spin.setEnabled(False)
+            self.duration_tolerance_spin.setEnabled(False)
             self.continue_button.setEnabled(False)
             self.stop_button.setEnabled(True)
             self.progress_bar.setValue(0)
             self._set_stage("Working...")
 
-            self._worker = WorkerThread(task, self._root_dir or "", self._binaries, self.max_threads_spin.value(), self)
+            self._worker = WorkerThread(
+                task,
+                self._root_dir or "",
+                self._binaries,
+                self.max_threads_spin.value(),
+                self.duration_tolerance_spin.value(),
+                prepared_video_paths=prepared_video_paths,
+                parent=self,
+            )
             self._worker.signal_log.connect(self._append_log)
-            self._worker.signal_progress.connect(self.progress_bar.setValue)
-            self._worker.signal_stage.connect(self._set_stage)
+            self._worker.signal_progress.connect(self._on_progress)
+            self._worker.signal_stage.connect(self._on_stage_signal)
+            self._worker.signal_status.connect(self._on_status_update)
             self._worker.signal_result.connect(self._add_result_row)
             self._worker.signal_done.connect(self._on_task_done)
             self._worker.signal_finished.connect(self._on_finished)
@@ -1943,60 +2564,155 @@ def run_gui(binaries: FFmpegBinaries) -> int:
             self.current_phase = PHASE_IDLE
             self._active_task = None
             self._root_dir = None
+            self._prepared_phase3_videos = []
             self.start_button.setEnabled(True)
+            self.browse_button.setEnabled(True)
+            self.scan_mode_combo.setEnabled(True)
+            self.max_threads_spin.setEnabled(True)
+            self.duration_tolerance_spin.setEnabled(True)
             self.continue_button.setEnabled(False)
             self.continue_button.setVisible(False)
             self.stop_button.setEnabled(False)
             self.progress_bar.setValue(0)
             self._set_stage("Idle")
+            self._update_result_action_states()
 
         def _set_stage(self, stage: str) -> None:
             stage_str = str(stage).strip() or "Working..."
-            self.stage_label.setText(f"Stage: {stage_str}")
+            if str(self._status_info.get("stage") or "") != stage_str:
+                self._stage_started_at = time.time()
+            self._status_info["stage"] = stage_str
+            self._render_stage_label()
+
+        def _on_stage_signal(self, stage: str) -> None:
+            self._set_stage(stage)
+
+        def _on_status_update(self, payload: dict) -> None:
+            if not isinstance(payload, dict):
+                return
+            stage_name = str(payload.get("stage") or self._status_info.get("stage") or "Working...")
+            if stage_name != str(self._status_info.get("stage") or ""):
+                self._stage_started_at = time.time()
+            for key, value in payload.items():
+                self._status_info[key] = value
+            self._status_info["stage"] = stage_name
+            self._render_stage_label()
+
+        def _on_progress(self, value: int) -> None:
+            try:
+                self.progress_bar.setValue(max(0, min(100, int(value))))
+            except Exception:
+                self.progress_bar.setValue(0)
+            self._render_stage_label()
+
+        def _render_stage_label(self) -> None:
+            stage_name = str(self._status_info.get("stage") or "Working...")
+            total = int(self._status_info.get("total") or 0)
+            completed = int(self._status_info.get("completed") or 0)
+            current_file = str(self._status_info.get("current_file") or "").strip()
+            current_file = Path(current_file).name if current_file else ""
+
+            message = f"Stage: {stage_name}"
+            if total > 0:
+                message += f" — {completed}/{total}"
+                eta_seconds = None
+                if self._stage_started_at and completed > 0 and completed < total:
+                    elapsed = max(0.001, time.time() - self._stage_started_at)
+                    eta_seconds = (elapsed / completed) * max(0, total - completed)
+                if eta_seconds is not None:
+                    message += f" — {_format_eta(eta_seconds)}"
+                elif completed >= total:
+                    message += " — ETA: done"
+            if current_file:
+                message += f" — {current_file}"
+            self.stage_label.setText(message)
+
+        def _summary_message(self, processed: int, duplicates: int) -> str:
+            reclaimable = 0
+            for row in range(self.results_table.rowCount()):
+                payload = self._get_row_payload(row)
+                if not payload:
+                    continue
+                original_size = int(payload.get("original_size") or 0)
+                duplicate_size = int(payload.get("duplicate_size") or 0)
+                if original_size > 0 and duplicate_size > 0:
+                    reclaimable += min(original_size, duplicate_size)
+
+            elapsed = None
+            if self._scan_started_at is not None:
+                elapsed = max(0.0, time.time() - self._scan_started_at)
+
+            return (
+                f"Scanned {processed} videos | Found {duplicates} duplicate pairs | "
+                f"Total space reclaimable: {_human_readable_size(reclaimable)} | "
+                f"Scan time: {_format_duration(elapsed or 0.0)}"
+            )
+
+        def _finish_scan_summary(self, processed: int, duplicates: int) -> None:
+            summary = self._summary_message(processed, duplicates)
+            self.summary_label.setText(f"Summary: {summary}")
+            self.statusBar().showMessage(summary, 12000)
 
         def _on_task_done(self, task: str, summary: dict) -> None:
             cancelled = bool(summary.get("cancelled"))
             if cancelled:
                 self._append_log(f"[INFO] {_timestamp()} Task cancelled.")
+                self._refresh_table_state()
                 self._reset_ui()
                 return
 
             if task == "phase1_size":
+                if self._root_dir:
+                    self._open_directory_in_file_manager(self._root_dir)
+                if self._scan_mode == SCAN_MODE_SIZE_ONLY:
+                    self.statusBar().showMessage("Size Match Only workflow complete.", 5000)
+                    self._reset_ui()
+                    return
+
                 self.continue_button.setVisible(True)
                 self.continue_button.setEnabled(True)
                 self._append_log("Phase 1 Complete. Click Continue when ready.")
+            elif task == "phase2_time":
                 if self._root_dir:
                     self._open_directory_in_file_manager(self._root_dir)
-            elif task == "phase2_time":
+                if self._scan_mode == SCAN_MODE_DURATION_ONLY:
+                    self.statusBar().showMessage("Duration Match Only workflow complete.", 5000)
+                    self._reset_ui()
+                    return
+
                 self.continue_button.setVisible(True)
                 self.continue_button.setEnabled(True)
                 self._append_log("Phase 2 Complete. Click Continue to proceed.")
-                if self._root_dir:
-                    self._open_directory_in_file_manager(self._root_dir)
             elif task == "phase3_prepare":
+                self._prepared_phase3_videos = list(summary.get("prepared_videos") or [])
                 reply = QMessageBox.question(
                     self,
-                    "Proceed to Advanced Scan?",
-                    "Phase 1 & 2 Complete. Do you want to proceed with the Advanced Content Scan (pHash)?",
+                    "Proceed to Content Scan?",
+                    "Phase 1 and Phase 2 are complete. Do you want to continue with the content scan using the prepared file list?",
                     QMessageBox.Yes | QMessageBox.No,
-                    QMessageBox.No,
+                    QMessageBox.Yes,
                 )
                 if reply != QMessageBox.Yes:
                     self._append_log("[INFO] Advanced content scan skipped. Workflow complete.")
                     self._reset_ui()
                     return
                 self.current_phase = PHASE_CONTENT
+                self.results_table.setSortingEnabled(False)
                 self.results_table.setRowCount(0)
+                self._selected_delete_paths.clear()
                 self.progress_bar.setValue(0)
-                self._start_task("phase3_content")
+                self._start_task("phase3_content", prepared_video_paths=self._prepared_phase3_videos)
             elif task in {"phase3_content", "phase3_direct"}:
                 processed = int(summary.get("processed") or 0)
                 duplicates = int(summary.get("duplicates") or 0)
+                self.results_table.setSortingEnabled(self.results_table.rowCount() > 0)
+                self._refresh_table_state()
+                self._finish_scan_summary(processed, duplicates)
                 if processed > 0 and duplicates == 0:
                     QMessageBox.information(
                         self,
                         "Scan Complete",
-                        f"Scan Complete. No duplicates found among {processed} processed videos.",
+                        f"Scan complete. No duplicates found among {processed} processed videos.",
                     )
                 self._reset_ui()
 
@@ -2004,6 +2720,7 @@ def run_gui(binaries: FFmpegBinaries) -> int:
             if self.sender() is self._worker:
                 self.stop_button.setEnabled(False)
                 self._worker = None
+                self._update_result_action_states()
 
         def _open_directory_in_file_manager(self, path: str) -> None:
             target = _safe_resolve_path(path, strict=False)
@@ -2042,7 +2759,7 @@ def run_gui(binaries: FFmpegBinaries) -> int:
                 return
             try:
                 if os.name == "nt":
-                    os.startfile(str(p))  
+                    os.startfile(str(p))
                 else:
                     QDesktopServices.openUrl(QUrl.fromLocalFile(str(p)))
             except Exception as exc:
@@ -2091,25 +2808,111 @@ def run_gui(binaries: FFmpegBinaries) -> int:
             except Exception as exc:
                 self._append_log(f"[WARN] {_timestamp()} Failed to open MediaInfo: {exc}")
 
-        def _delete_file(self, path: str) -> None:
+        def _probe_file_info(self, path: str) -> dict:
             path_str = str(path).strip()
-            if not path_str:
-                return
             p = _safe_resolve_path(path_str, strict=False)
-            if not _safe_exists(p):
-                self._append_log(f"[WARN] {_timestamp()} File not found: {path_str}")
-                QMessageBox.warning(self, "File not found", f"File does not exist:\n\n{path_str}")
-                self._refresh_table_state()
+            file_size = 0
+            try:
+                file_size = int(p.stat().st_size)
+            except Exception:
+                file_size = 0
+
+            duration_s = 0.0
+            width = 0
+            height = 0
+            validator = FFprobeValidator(self._binaries.ffprobe_path, timeout_s=15)
+            meta, _err = validator.validate(p)
+            if meta is not None:
+                duration_s = float(meta.duration_s)
+                width = int(meta.width)
+                height = int(meta.height)
+
+            return {
+                "path": str(p),
+                "file_size": file_size,
+                "duration_s": duration_s,
+                "width": width,
+                "height": height,
+            }
+
+        def _get_row_payload(self, row: int) -> dict:
+            for col in (0, 1):
+                item = self.results_table.item(row, col)
+                if item is None:
+                    continue
+                payload = item.data(PAYLOAD_ROLE)
+                if isinstance(payload, dict):
+                    return payload
+            return {}
+
+        def _payload_info_for_path(self, payload: dict, path: str) -> Optional[dict]:
+            path_str = str(path)
+            if path_str == str(payload.get("original") or ""):
+                return {
+                    "path": path_str,
+                    "file_size": int(payload.get("original_size") or 0),
+                    "duration_s": float(payload.get("original_duration_s") or 0.0),
+                    "width": int(payload.get("original_width") or 0),
+                    "height": int(payload.get("original_height") or 0),
+                }
+            if path_str == str(payload.get("duplicate") or ""):
+                return {
+                    "path": path_str,
+                    "file_size": int(payload.get("duplicate_size") or 0),
+                    "duration_s": float(payload.get("duplicate_duration_s") or 0.0),
+                    "width": int(payload.get("duplicate_width") or 0),
+                    "height": int(payload.get("duplicate_height") or 0),
+                }
+            return None
+
+        def _lookup_file_info(self, path: str, payload: Optional[dict] = None) -> dict:
+            if payload:
+                info = self._payload_info_for_path(payload, path)
+                if info is not None:
+                    return info
+            return self._probe_file_info(path)
+
+        def _copy_file_info(self, path: str, payload: Optional[dict] = None) -> None:
+            info = self._lookup_file_info(path, payload)
+            resolution = (
+                f"{int(info.get('width') or 0)}x{int(info.get('height') or 0)}"
+                if int(info.get("width") or 0) > 0 and int(info.get("height") or 0) > 0
+                else "N/A"
+            )
+            text = "\n".join(
+                [
+                    f"Filename: {Path(str(info.get('path') or path)).name}",
+                    f"Path: {str(info.get('path') or path)}",
+                    f"Size: {_human_readable_size(int(info.get('file_size') or 0))}",
+                    f"Duration: {_format_duration(float(info.get('duration_s') or 0.0))}",
+                    f"Resolution: {resolution}",
+                ]
+            )
+            QApplication.clipboard().setText(text)
+            self.statusBar().showMessage("File info copied to clipboard.", 4000)
+
+        def _delete_paths(self, paths: list[str]) -> None:
+            unique_paths = sorted({str(path).strip() for path in paths if str(path).strip()})
+            if not unique_paths:
                 return
 
-            msg = f"Are you sure you want to delete this file?\n\n{path_str}"
             try:
-                from send2trash import send2trash as _send2trash  
+                from send2trash import send2trash as _send2trash
 
                 send2trash_available = True
             except Exception:
                 _send2trash = None
                 send2trash_available = False
+
+            if len(unique_paths) == 1:
+                msg = f"Are you sure you want to delete this file?\n\n{unique_paths[0]}"
+            else:
+                msg = (
+                    f"Are you sure you want to delete these {len(unique_paths)} files?\n\n"
+                    + "\n".join(unique_paths[:10])
+                )
+                if len(unique_paths) > 10:
+                    msg += f"\n... and {len(unique_paths) - 10} more."
 
             if not send2trash_available:
                 msg += "\n\n(send2trash not available; this may permanently delete the file.)"
@@ -2124,64 +2927,172 @@ def run_gui(binaries: FFmpegBinaries) -> int:
             if reply != QMessageBox.Yes:
                 return
 
-            try:
-                if _send2trash is not None:
-                    _send2trash(str(p))
-                else:
-                    os.remove(str(p))
-                self._append_log(f"[INFO] {_timestamp()} Deleted: {path_str}")
-            except Exception as exc:
-                self._append_log(f"[WARN] {_timestamp()} Delete failed: {exc}")
-                QMessageBox.warning(self, "Delete failed", f"Could not delete:\n\n{path_str}\n\n{exc}")
-            finally:
-                self._refresh_table_state()
+            deleted = 0
+            failed = 0
+            for path_str in unique_paths:
+                p = _safe_resolve_path(path_str, strict=False)
+                if not _safe_exists(p):
+                    self._append_log(f"[WARN] {_timestamp()} File not found: {path_str}")
+                    self._selected_delete_paths.discard(str(p))
+                    failed += 1
+                    continue
+                try:
+                    if _send2trash is not None:
+                        _send2trash(str(p))
+                    else:
+                        os.remove(str(p))
+                    deleted += 1
+                    self._selected_delete_paths.discard(str(p))
+                    self._append_log(f"[INFO] {_timestamp()} Deleted: {path_str}")
+                except Exception as exc:
+                    failed += 1
+                    self._append_log(f"[WARN] {_timestamp()} Delete failed for {path_str}: {exc}")
+
+            self._refresh_table_state()
+            self._update_result_action_states()
+            if deleted > 0:
+                self.statusBar().showMessage(f"Deleted {deleted} file(s).", 5000)
+            if failed > 0:
+                QMessageBox.warning(self, "Delete incomplete", f"Deleted {deleted} file(s); {failed} failed.")
+
+        def _delete_file(self, path: str) -> None:
+            self._delete_paths([path])
+
+        def _delete_selected_files(self) -> None:
+            self._delete_paths(sorted(self._selected_delete_paths))
+
+        def _delete_current_selected_file(self) -> None:
+            row = self.results_table.currentRow()
+            col = self.results_table.currentColumn()
+            if row < 0:
+                return
+            if col not in (0, 1):
+                col = 1 if self._get_raw_path(row, 1) else 0
+            path = self._get_raw_path(row, col)
+            if path:
+                self._delete_file(path)
 
         def _get_raw_path(self, row: int, col: int) -> str:
             item = self.results_table.item(row, col)
             if item is None:
                 return ""
-            raw = item.data(Qt.UserRole)
+            raw = item.data(PATH_ROLE)
             if isinstance(raw, str) and raw.strip():
                 return raw
             return item.text().replace(" (Deleted)", "").strip()
 
+        def _apply_row_visual_state(self, row: int, *, exists_a: bool, exists_b: bool) -> None:
+            path_a = self._get_raw_path(row, 0)
+            path_b = self._get_raw_path(row, 1)
+            row_brush = self._conflict_brush if (exists_a and exists_b) else self._resolved_brush
+
+            for col in range(self.results_table.columnCount()):
+                item = self.results_table.item(row, col)
+                if item is None:
+                    continue
+                item.setBackground(row_brush)
+                item.setForeground(QBrush())
+                font = item.font()
+                if col in (0, 1):
+                    font.setBold(False)
+                item.setFont(font)
+
+            for col, exists in ((0, exists_a), (1, exists_b)):
+                item = self.results_table.item(row, col)
+                if item is None:
+                    continue
+                raw_path = self._get_raw_path(row, col)
+                item.setData(PATH_ROLE, raw_path)
+                item.setText(raw_path + ("" if exists else " (Deleted)"))
+                font = item.font()
+                font.setStrikeOut(not exists)
+                item.setFont(font)
+
+            for col, selected_path in ((0, path_a), (1, path_b)):
+                if selected_path and selected_path in self._selected_delete_paths:
+                    item = self.results_table.item(row, col)
+                    if item is not None:
+                        item.setBackground(self._delete_selection_brush)
+                        item.setForeground(self._delete_selection_foreground)
+                        font = item.font()
+                        font.setBold(True)
+                        item.setFont(font)
+
         def _refresh_table_state(self) -> None:
             rows = self.results_table.rowCount()
             if rows <= 0:
+                self._update_result_action_states()
                 return
 
-            conflict_brush = QBrush(QColor(255, 220, 220))
-            resolved_brush = QBrush(QColor(220, 255, 220))
+            if self._worker is not None and self._worker.isRunning():
+                self._update_result_action_states()
+                return
+
+            unique_paths: set[str] = set()
+            for row in range(rows):
+                for col in (0, 1):
+                    raw_path = self._get_raw_path(row, col)
+                    if raw_path:
+                        unique_paths.add(raw_path)
+
+            existence_map = {path: _safe_exists(path) for path in unique_paths}
 
             for row in range(rows):
                 path_a = self._get_raw_path(row, 0)
                 path_b = self._get_raw_path(row, 1)
+                exists_a = existence_map.get(path_a, False) if path_a else False
+                exists_b = existence_map.get(path_b, False) if path_b else False
+                self._apply_row_visual_state(row, exists_a=exists_a, exists_b=exists_b)
 
-                exists_a = bool(path_a and _safe_exists(path_a))
-                exists_b = bool(path_b and _safe_exists(path_b))
+            self._update_result_action_states()
 
-                item_a = self.results_table.item(row, 0)
-                item_b = self.results_table.item(row, 1)
+        def _build_file_tooltip(
+            self,
+            path: str,
+            file_size: int,
+            duration_s: float,
+            width: int,
+            height: int,
+        ) -> str:
+            resolution = f"{width}x{height}" if width > 0 and height > 0 else "N/A"
+            return "\n".join(
+                [
+                    path,
+                    f"Size: {_human_readable_size(file_size)}",
+                    f"Duration: {_format_duration(duration_s)}",
+                    f"Resolution: {resolution}",
+                ]
+            )
 
-                if item_a is not None and path_a:
-                    item_a.setData(Qt.UserRole, path_a)
-                    item_a.setText(path_a + ("" if exists_a else " (Deleted)"))
-                    font = item_a.font()
-                    font.setStrikeOut(not exists_a)
-                    item_a.setFont(font)
+        def _make_path_item(
+            self,
+            path: str,
+            payload: dict,
+            *,
+            file_size: int,
+            duration_s: float,
+            width: int,
+            height: int,
+        ) -> SortableTableWidgetItem:
+            item = SortableTableWidgetItem(path)
+            item.setData(PATH_ROLE, path)
+            item.setData(SORT_ROLE, _normalized_text(path).casefold())
+            item.setData(PAYLOAD_ROLE, payload)
+            item.setToolTip(self._build_file_tooltip(path, file_size, duration_s, width, height))
+            return item
 
-                if item_b is not None and path_b:
-                    item_b.setData(Qt.UserRole, path_b)
-                    item_b.setText(path_b + ("" if exists_b else " (Deleted)"))
-                    font = item_b.font()
-                    font.setStrikeOut(not exists_b)
-                    item_b.setFont(font)
+        def _make_value_item(self, text: str, sort_value) -> SortableTableWidgetItem:
+            item = SortableTableWidgetItem(text)
+            item.setData(SORT_ROLE, sort_value)
+            return item
 
-                row_brush = conflict_brush if (exists_a and exists_b) else resolved_brush
-                for col in range(self.results_table.columnCount()):
-                    item = self.results_table.item(row, col)
-                    if item is not None:
-                        item.setBackground(row_brush)
+        def _update_result_action_states(self) -> None:
+            has_results = self.results_table.rowCount() > 0
+            worker_running = self._worker is not None and self._worker.isRunning()
+            self.export_button.setEnabled(has_results)
+            self.auto_select_smaller_button.setEnabled(has_results and not worker_running)
+            self.auto_select_lower_res_button.setEnabled(has_results and not worker_running)
+            self.delete_selected_button.setEnabled(bool(self._selected_delete_paths) and not worker_running)
 
         def _on_results_double_clicked(self, row: int, col: int) -> None:
             if col not in (0, 1):
@@ -2189,7 +3100,6 @@ def run_gui(binaries: FFmpegBinaries) -> int:
             path = self._get_raw_path(row, col)
             if path:
                 self._open_file_location(path)
-                self._refresh_table_state()
 
         def _on_results_context_menu(self, pos) -> None:
             item = self.results_table.itemAt(pos)
@@ -2197,19 +3107,19 @@ def run_gui(binaries: FFmpegBinaries) -> int:
                 return
             row = item.row()
             col = item.column()
+            payload = self._get_row_payload(row)
 
             if col in (0, 1):
                 path = self._get_raw_path(row, col)
             else:
                 path = self._get_raw_path(row, 1) or self._get_raw_path(row, 0)
-
             if not path:
                 return
 
             menu = QMenu(self)
-
             action_play = menu.addAction("Play Video")
             action_reveal = menu.addAction("Reveal in File Manager")
+            action_copy_info = menu.addAction("Copy File Info")
             action_mediainfo = menu.addAction("MediaInfo")
             menu.addSeparator()
             action_delete = menu.addAction("Delete File")
@@ -2222,32 +3132,155 @@ def run_gui(binaries: FFmpegBinaries) -> int:
                 self._play_video(path)
             elif chosen == action_reveal:
                 self._open_file_location(path)
+            elif chosen == action_copy_info:
+                self._copy_file_info(path, payload)
             elif chosen == action_mediainfo:
                 self._open_mediainfo(path)
             elif chosen == action_delete:
                 self._delete_file(path)
 
-            self._refresh_table_state()
-
         def _add_result_row(self, payload: dict) -> None:
-            original = str(payload.get("original", ""))
-            duplicate = str(payload.get("duplicate", ""))
+            original = str(payload.get("original") or "")
+            duplicate = str(payload.get("duplicate") or "")
+            original_size = int(payload.get("original_size") or 0)
+            duplicate_size = int(payload.get("duplicate_size") or 0)
+            original_duration = float(payload.get("original_duration_s") or 0.0)
+            duplicate_duration = float(payload.get("duplicate_duration_s") or 0.0)
+            original_width = int(payload.get("original_width") or 0)
+            original_height = int(payload.get("original_height") or 0)
+            duplicate_width = int(payload.get("duplicate_width") or 0)
+            duplicate_height = int(payload.get("duplicate_height") or 0)
             similarity = float(payload.get("similarity") or 0.0)
             offset_s = float(payload.get("offset_s") or 0.0)
 
             row = self.results_table.rowCount()
             self.results_table.insertRow(row)
 
-            item_original = QTableWidgetItem(original)
-            item_original.setData(Qt.UserRole, original)
-            item_duplicate = QTableWidgetItem(duplicate)
-            item_duplicate.setData(Qt.UserRole, duplicate)
+            item_original = self._make_path_item(
+                original,
+                payload,
+                file_size=original_size,
+                duration_s=original_duration,
+                width=original_width,
+                height=original_height,
+            )
+            item_duplicate = self._make_path_item(
+                duplicate,
+                payload,
+                file_size=duplicate_size,
+                duration_s=duplicate_duration,
+                width=duplicate_width,
+                height=duplicate_height,
+            )
+
             self.results_table.setItem(row, 0, item_original)
             self.results_table.setItem(row, 1, item_duplicate)
-            self.results_table.setItem(row, 2, QTableWidgetItem(f"{similarity:.2f}"))
+            self.results_table.setItem(row, 2, self._make_value_item(_human_readable_size(original_size), original_size))
+            self.results_table.setItem(row, 3, self._make_value_item(_human_readable_size(duplicate_size), duplicate_size))
+            self.results_table.setItem(row, 4, self._make_value_item(_format_duration(original_duration), original_duration))
+            self.results_table.setItem(row, 5, self._make_value_item(_format_duration(duplicate_duration), duplicate_duration))
+            self.results_table.setItem(row, 6, self._make_value_item(f"{similarity:.2f}", similarity))
             sign = "+" if offset_s >= 0 else "-"
-            self.results_table.setItem(row, 3, QTableWidgetItem(f"{sign}{abs(offset_s):.1f}s"))
+            self.results_table.setItem(row, 7, self._make_value_item(f"{sign}{abs(offset_s):.1f}s", offset_s))
+
+            self._apply_row_visual_state(row, exists_a=True, exists_b=True)
+            self._update_result_action_states()
+            self.statusBar().showMessage(f"Found {self.results_table.rowCount()} duplicate pair(s).", 3000)
+
+        def _select_delete_candidate(self, payload: dict, strategy: str) -> str:
+            original = str(payload.get("original") or "")
+            duplicate = str(payload.get("duplicate") or "")
+            if strategy == "smaller":
+                original_size = int(payload.get("original_size") or 0)
+                duplicate_size = int(payload.get("duplicate_size") or 0)
+                if original_size > 0 and duplicate_size > 0:
+                    if original_size < duplicate_size:
+                        return original
+                    if duplicate_size < original_size:
+                        return duplicate
+                return duplicate or original
+
+            original_area = int(payload.get("original_width") or 0) * int(payload.get("original_height") or 0)
+            duplicate_area = int(payload.get("duplicate_width") or 0) * int(payload.get("duplicate_height") or 0)
+            if original_area > 0 and duplicate_area > 0:
+                if original_area < duplicate_area:
+                    return original
+                if duplicate_area < original_area:
+                    return duplicate
+
+            original_size = int(payload.get("original_size") or 0)
+            duplicate_size = int(payload.get("duplicate_size") or 0)
+            if original_size > 0 and duplicate_size > 0:
+                if original_size < duplicate_size:
+                    return original
+                if duplicate_size < original_size:
+                    return duplicate
+            return duplicate or original
+
+        def _auto_select_keep_larger(self) -> None:
+            self._selected_delete_paths.clear()
+            for row in range(self.results_table.rowCount()):
+                payload = self._get_row_payload(row)
+                if not payload:
+                    continue
+                candidate = self._select_delete_candidate(payload, "smaller")
+                if candidate:
+                    self._selected_delete_paths.add(candidate)
             self._refresh_table_state()
+            self.statusBar().showMessage(
+                f"Auto-selected {len(self._selected_delete_paths)} file(s) to delete by size.",
+                5000,
+            )
+
+        def _auto_select_keep_higher_res(self) -> None:
+            self._selected_delete_paths.clear()
+            for row in range(self.results_table.rowCount()):
+                payload = self._get_row_payload(row)
+                if not payload:
+                    continue
+                candidate = self._select_delete_candidate(payload, "lower_res")
+                if candidate:
+                    self._selected_delete_paths.add(candidate)
+            self._refresh_table_state()
+            self.statusBar().showMessage(
+                f"Auto-selected {len(self._selected_delete_paths)} file(s) to delete by resolution.",
+                5000,
+            )
+
+        def _export_results_to_csv(self) -> None:
+            if self.results_table.rowCount() <= 0:
+                return
+            default_name = f"video_deduplicator_results_{time.strftime('%Y%m%d_%H%M%S')}.csv"
+            chosen, _ = QFileDialog.getSaveFileName(
+                self,
+                "Export Results to CSV",
+                str(_safe_resolve_path(default_name, strict=False)),
+                "CSV Files (*.csv);;All Files (*)",
+            )
+            if not chosen:
+                return
+
+            headers = [self.results_table.horizontalHeaderItem(col).text() for col in range(self.results_table.columnCount())]
+            try:
+                with open(chosen, "w", newline="", encoding="utf-8-sig") as handle:
+                    writer = csv.writer(handle)
+                    writer.writerow(headers)
+                    for row in range(self.results_table.rowCount()):
+                        writer.writerow(
+                            [
+                                self._get_raw_path(row, 0),
+                                self._get_raw_path(row, 1),
+                                self.results_table.item(row, 2).text() if self.results_table.item(row, 2) else "",
+                                self.results_table.item(row, 3).text() if self.results_table.item(row, 3) else "",
+                                self.results_table.item(row, 4).text() if self.results_table.item(row, 4) else "",
+                                self.results_table.item(row, 5).text() if self.results_table.item(row, 5) else "",
+                                self.results_table.item(row, 6).text() if self.results_table.item(row, 6) else "",
+                                self.results_table.item(row, 7).text() if self.results_table.item(row, 7) else "",
+                            ]
+                        )
+                self.statusBar().showMessage(f"Results exported: {chosen}", 5000)
+            except Exception as exc:
+                QMessageBox.warning(self, "Export failed", f"Could not export results:\n\n{chosen}\n\n{exc}")
 
         def closeEvent(self, event) -> None:
             if self._worker and self._worker.isRunning():
