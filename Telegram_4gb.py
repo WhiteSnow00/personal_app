@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 import json
 import logging
 import math
@@ -14,7 +13,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-__version__ = "3.0.0"
+__version__ = "1.0.1"
 
 THRESHOLD_BYTES = 4 * 1024 ** 3
 TARGET_BYTES = 3800 * 1024 ** 2
@@ -30,6 +29,9 @@ AUDIO_BITRATE_KBPS = 128
 PRESET = "fast"
 ENCODE_CODEC = "libx264"
 
+ENCODE_TIMEOUT = 86400
+FAIL_MARKER_SUFFIX = ".encode_fail"
+
 CODEC_EFFICIENCY = {
     "h264": 1.0,
     "avc": 1.0,
@@ -43,7 +45,6 @@ CODEC_EFFICIENCY = {
 }
 
 SUPPORTED_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm"}
-
 
 _CURRENT_TEMPS: List[Path] = []
 _CURRENT_OUTPUT: Optional[Path] = None
@@ -129,6 +130,30 @@ def cleanup_paths(paths: List[Path]) -> None:
                 logging.debug("Cleaned up: %s", p)
         except OSError as exc:
             logging.warning("Failed to remove %s: %s", p, exc)
+
+
+def fail_marker_path(video_path: Path) -> Path:
+    return video_path.with_suffix(video_path.suffix + FAIL_MARKER_SUFFIX)
+
+
+def has_fail_marker(video_path: Path) -> bool:
+    return fail_marker_path(video_path).exists()
+
+
+def set_fail_marker(video_path: Path) -> None:
+    try:
+        fail_marker_path(video_path).write_text(str(int(time.time())))
+    except OSError:
+        pass
+
+
+def clear_fail_marker(video_path: Path) -> None:
+    try:
+        p = fail_marker_path(video_path)
+        if p.exists():
+            p.unlink()
+    except OSError:
+        pass
 
 
 def lock_path_for(video_path: Path) -> Path:
@@ -256,18 +281,18 @@ def get_audio_bitrate(info: dict) -> int:
 
 def get_video_bitrate(info: dict) -> int:
     video = get_video_stream(info)
-    if video is None:
-        return 0
-    br = video.get("bit_rate")
-    if br is not None:
-        return int(float(br) / 1000)
+    if video is not None:
+        br = video.get("bit_rate")
+        if br is not None:
+            return int(float(br) / 1000)
     fmt = info.get("format", {})
-    file_size = fmt.get("size")
+    file_size_str = fmt.get("size")
     duration = get_duration(info)
-    if file_size and duration > 0:
-        total_kbps = int(float(file_size) * 8 / duration / 1000)
+    if file_size_str and duration > 0:
+        file_size = int(float(file_size_str))
         audio_kbps = get_audio_bitrate(info)
-        return max(0, total_kbps - audio_kbps)
+        total_kbps = int(file_size * 8 / duration / 1000)
+        return max(100, total_kbps - audio_kbps)
     return 0
 
 
@@ -275,38 +300,33 @@ def get_resolution(info: dict) -> Tuple[int, int]:
     video = get_video_stream(info)
     if video is None:
         return (0, 0)
-    return (
-        video.get("width", 0),
-        video.get("height", 0),
-    )
+    return (video.get("width", 0), video.get("height", 0))
 
 
 def get_fps(info: dict) -> float:
     video = get_video_stream(info)
     if video is None:
         return 0.0
-    avg_frame_rate = video.get("avg_frame_rate", "")
-    if "/" in str(avg_frame_rate):
-        try:
-            num, den = avg_frame_rate.split("/")
-            return float(num) / float(den)
-        except (ValueError, ZeroDivisionError):
-            pass
-    r_frame_rate = video.get("r_frame_rate", "")
-    if "/" in str(r_frame_rate):
-        try:
-            num, den = r_frame_rate.split("/")
-            return float(num) / float(den)
-        except (ValueError, ZeroDivisionError):
-            pass
+    for key in ("avg_frame_rate", "r_frame_rate"):
+        rate = video.get(key, "")
+        if "/" in str(rate):
+            try:
+                num, den = str(rate).split("/")
+                return float(num) / float(den)
+            except (ValueError, ZeroDivisionError):
+                pass
     return 0.0
 
 
-def get_codec_efficiency(info: dict) -> float:
+def get_codec_name(info: dict) -> str:
     video = get_video_stream(info)
     if video is None:
-        return 1.0
-    codec = video.get("codec_name", "h264").lower()
+        return "unknown"
+    return video.get("codec_name", "unknown")
+
+
+def get_codec_efficiency(info: dict) -> float:
+    codec = get_codec_name(info).lower()
     return CODEC_EFFICIENCY.get(codec, 1.0)
 
 
@@ -314,16 +334,18 @@ def analyze_source_quality(info: dict) -> Dict[str, Any]:
     width, height = get_resolution(info)
     fps = get_fps(info)
     video_kbps = get_video_bitrate(info)
-    duration = get_duration(info)
-    codec = get_video_stream(info)
-    codec_name = codec.get("codec_name", "unknown") if codec else "unknown"
+    codec_name = get_codec_name(info)
+    efficiency = get_codec_efficiency(info)
 
     result: Dict[str, Any] = {
         "bpp": 0.0,
+        "effective_bpp": 0.0,
         "category": "unknown",
         "video_kbps": video_kbps,
         "resolution": (width, height),
         "fps": fps,
+        "codec": codec_name,
+        "codec_efficiency": efficiency,
         "message": "",
         "should_warn": False,
     }
@@ -333,13 +355,9 @@ def analyze_source_quality(info: dict) -> Dict[str, Any]:
         return result
 
     bpp = video_kbps / (width * height * fps)
-    efficiency = get_codec_efficiency(info)
     effective_bpp = bpp * efficiency
-
     result["bpp"] = bpp
     result["effective_bpp"] = effective_bpp
-    result["codec"] = codec_name
-    result["codec_efficiency"] = efficiency
 
     if effective_bpp > 0.3:
         result["category"] = "high"
@@ -349,24 +367,14 @@ def analyze_source_quality(info: dict) -> Dict[str, Any]:
         result["message"] = f"Medium quality source (BPP={bpp:.4f}, effective={effective_bpp:.4f}, codec={codec_name})"
     elif effective_bpp >= 0.08:
         result["category"] = "compressed"
-        result["message"] = (
-            f"Already compressed source (BPP={bpp:.4f}, effective={effective_bpp:.4f}, codec={codec_name}). "
-            f"Quality may be poor. Consider -c copy instead."
-        )
+        result["message"] = f"Already compressed source (BPP={bpp:.4f}, effective={effective_bpp:.4f}, codec={codec_name}). Quality may be poor."
         result["should_warn"] = True
     else:
         result["category"] = "heavily_compressed"
-        result["message"] = (
-            f"Heavily compressed source (BPP={bpp:.4f}, effective={effective_bpp:.4f}, codec={codec_name}). "
-            f"Consider just copying (-c copy) if size is already acceptable."
-        )
+        result["message"] = f"Heavily compressed source (BPP={bpp:.4f}, effective={effective_bpp:.4f}, codec={codec_name}). Consider -c copy if size is acceptable."
         result["should_warn"] = True
 
-    logging.info(
-        "[QUALITY] %s (raw BPP=%.4f, effective BPP=%.4f, codec=%s, eff=%.1fx)",
-        result["message"], bpp, effective_bpp, codec_name, efficiency,
-    )
-
+    logging.info("[QUALITY] %s", result["message"])
     return result
 
 
@@ -419,7 +427,7 @@ def extract_sample(source: Path, output: Path, duration: float) -> None:
                 "-avoid_negative_ts", "make_zero",
                 str(clip_path),
             ]
-            logging.info("[SAMPLE] Clip %d/%d @ %.1fs (ultrafast re-encode)", idx, SAMPLE_CLIP_COUNT, start)
+            logging.info("[SAMPLE] Clip %d/%d @ %.1fs (ultrafast)", idx, SAMPLE_CLIP_COUNT, start)
             run_cmd(cmd, timeout=120)
 
         list_path = temp_dir / f"{source.stem}_concat_list_{os.getpid()}.txt"
@@ -454,7 +462,7 @@ def probe_sample(sample_path: Path, crf: int, maxrate_kbps: int, bufsize_kbps: i
         "-c:a", "copy", "-sn", "-dn",
         str(probe_out),
     ]
-    logging.info("[PROBE] CRF %d (maxrate=%dk, bufsize=%dk) → %s", crf, maxrate_kbps, bufsize_kbps, probe_out.name)
+    logging.info("[PROBE] CRF %d (maxrate=%dk, bufsize=%dk)", crf, maxrate_kbps, bufsize_kbps)
     try:
         run_cmd(cmd, timeout=300)
         size = get_file_size(probe_out)
@@ -477,13 +485,10 @@ def estimate_crf_for_target(
 
     valid.sort(key=lambda x: x[0])
 
-    extrapolated: List[Tuple[int, float]] = []
-    for crf, sz in valid:
-        extrapolated.append((crf, sz * r_time))
+    extrapolated = [(crf, sz * r_time) for crf, sz in valid]
 
     below = None
     above = None
-
     for crf, sz in extrapolated:
         if sz <= target_bytes:
             below = (crf, sz)
@@ -514,8 +519,7 @@ def estimate_crf_for_target(
     if k == 0 or math.isnan(k) or math.isinf(k):
         return None
 
-    c_target = c1 + (ln_s1 - ln_target) / k
-    return c_target
+    return c1 + (ln_s1 - ln_target) / k
 
 
 def run_crf_feasibility_probe(
@@ -538,52 +542,35 @@ def run_crf_feasibility_probe(
         if size > 0:
             probe_results.append((crf, size))
             full_est = size * r_time
-            logging.info("[PROBE] CRF %d → sample=%s | full_est=%s",
-                         crf, format_size(size), format_size(int(full_est)))
-        else:
-            logging.warning("[PROBE] CRF %d probe returned invalid size", crf)
+            logging.info("[PROBE] CRF %d -> sample=%s | full_est=%s", crf, format_size(size), format_size(int(full_est)))
 
     result: Dict[str, Any] = {
         "probe_results": probe_results,
         "estimated_crf": None,
-        "estimated_full_size": None,
         "is_feasible": False,
         "quality_warning": None,
         "can_reach_target": False,
     }
 
     if len(probe_results) < 2:
-        logging.warning("[PROBE] Insufficient valid probe results (%d/4)", len(probe_results))
-        result["quality_warning"] = "Could not determine feasibility — proceeding with caution"
+        result["quality_warning"] = "Insufficient probe results -- proceeding with caution"
         return result
 
     est_crf = estimate_crf_for_target(probe_results, target_bytes, r_time)
     result["estimated_crf"] = est_crf
 
     if est_crf is not None:
-        clamped_crf = max(CRF_CLAMP_MIN, min(CRF_CLAMP_MAX, est_crf))
-        result["estimated_full_size"] = None
-        logging.info("[PROBE] Estimated CRF for target: %.2f (clamped: %.0f)", est_crf, clamped_crf)
-
+        logging.info("[PROBE] Estimated CRF for target: %.2f", est_crf)
         if est_crf > CRF_CLAMP_MAX:
-            result["can_reach_target"] = False
-            result["quality_warning"] = (
-                f"Impossible target: estimated CRF {est_crf:.1f} exceeds max {CRF_CLAMP_MAX}. "
-                f"Source cannot be compressed to target size without severe quality loss."
-            )
+            result["quality_warning"] = f"Impossible target: estimated CRF {est_crf:.1f} exceeds max {CRF_CLAMP_MAX}"
         elif est_crf > 45:
             result["can_reach_target"] = True
             result["is_feasible"] = True
-            result["quality_warning"] = (
-                f"Estimated CRF {est_crf:.1f} — very low quality expected. "
-                f"Consider accepting larger file or resolution reduction."
-            )
+            result["quality_warning"] = f"Estimated CRF {est_crf:.1f} -- very low quality expected"
         elif est_crf > 40:
             result["can_reach_target"] = True
             result["is_feasible"] = True
-            result["quality_warning"] = (
-                f"Estimated CRF {est_crf:.1f} — low quality, but achievable."
-            )
+            result["quality_warning"] = f"Estimated CRF {est_crf:.1f} -- low quality, but achievable"
         else:
             result["can_reach_target"] = True
             result["is_feasible"] = True
@@ -593,14 +580,8 @@ def run_crf_feasibility_probe(
         if max_full_est < target_bytes:
             result["can_reach_target"] = True
             result["is_feasible"] = True
-            result["quality_warning"] = (
-                "Could not estimate exact CRF, but highest probe is below target — proceeding"
-            )
         else:
-            result["can_reach_target"] = False
-            result["quality_warning"] = (
-                "Could not estimate CRF, and probes suggest target may not be achievable"
-            )
+            result["quality_warning"] = "Target may not be achievable"
 
     return result
 
@@ -633,16 +614,15 @@ def two_pass_encode_with_progress(
     video_args = build_ffmpeg_video_args(video_kbps, scale)
     passlog_prefix = str(passlogfile)
 
-    audio_args: List[str] = []
     if audio_codec in ("aac", "none", "unknown"):
         audio_args = ["-c:a", "copy"]
     else:
         audio_args = ["-c:a", "aac", "-b:a", f"{AUDIO_BITRATE_KBPS}k"]
-        logging.info("[ENCODE] Re-encoding audio %s → AAC %dkbps", audio_codec, AUDIO_BITRATE_KBPS)
+        logging.info("[ENCODE] Re-encoding audio %s -> AAC %dkbps", audio_codec, AUDIO_BITRATE_KBPS)
 
     sub_args: List[str] = ["-c:s", "copy"] if has_subs else ["-sn"]
 
-    logging.info("[ENCODE] Pass 1/2 — analysis")
+    logging.info("[ENCODE] Pass 1/2 -- analysis")
     pass1_cmd = [
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
         "-i", str(source),
@@ -657,12 +637,12 @@ def two_pass_encode_with_progress(
     ]
 
     try:
-        run_cmd(pass1_cmd, timeout=3600)
-    except subprocess.CalledProcessError as exc:
+        run_cmd(pass1_cmd, timeout=ENCODE_TIMEOUT)
+    except subprocess.CalledProcessError:
         cleanup_paths([Path(f"{passlog_prefix}-0.log"), Path(f"{passlog_prefix}-0.log.mbtree")])
         raise
 
-    logging.info("[ENCODE] Pass 2/2 — encoding with progress")
+    logging.info("[ENCODE] Pass 2/2 -- encoding with progress")
     pass2_cmd = [
         "ffmpeg", "-y", "-hide_banner",
         "-i", str(source),
@@ -761,33 +741,9 @@ def two_pass_encode_with_progress(
             text = stderr_path.read_text(encoding="utf-8").strip()
             if text:
                 stderr_text = text
-            except OSError:
-                pass
+        except OSError:
+            pass
         raise subprocess.CalledProcessError(process.returncode, pass2_cmd, output="", stderr=stderr_text)
-
-
-def verify_output_size(output_path: Path, threshold_bytes: int = THRESHOLD_BYTES) -> bool:
-    if not output_path.exists() or get_file_size(output_path) == 0:
-        logging.error("[VERIFY] Output missing or empty: %s", output_path.name)
-        return False
-
-    output_size = get_file_size(output_path)
-    logging.info("[VERIFY] Output size: %s", format_size(output_size))
-
-    if output_size > threshold_bytes:
-        logging.warning(
-            "[VERIFY] Output oversize: %s > %s",
-            format_size(output_size), format_size(threshold_bytes),
-        )
-        return False
-
-    try:
-        ffprobe_json(output_path)
-    except Exception as exc:
-        logging.error("[VERIFY] ffprobe sanity check failed: %s", exc)
-        return False
-
-    return True
 
 
 def calculate_retry_bitrate(
@@ -802,7 +758,7 @@ def calculate_retry_bitrate(
     new_kbps = int(old_video_kbps * ratio * 0.95)
     new_kbps = max(new_kbps, 100)
     logging.info(
-        "[RETRY] Bitrate correction: %dkbps → %dkbps (ratio=%.3f)",
+        "[RETRY] Bitrate correction: %dkbps -> %dkbps (ratio=%.3f)",
         old_video_kbps, new_kbps, ratio,
     )
     return new_kbps
@@ -824,18 +780,22 @@ def safe_move(src: Path, dest_dir: Path) -> None:
 def process_file(source: Path, work_dir: Path, delete_source: bool = True) -> bool:
     global _CURRENT_TEMPS, _CURRENT_OUTPUT, _CURRENT_LOCK
 
+    if has_fail_marker(source):
+        logging.info("[SKIP] Has fail marker: %s", source.name)
+        return False
+
     _CURRENT_TEMPS = []
     _CURRENT_OUTPUT = None
 
     s1_size = get_file_size(source)
     time.sleep(1.0)
     if get_file_size(source) != s1_size:
-        logging.info("[SKIP] File size is changing (still being copied?): %s", source.name)
+        logging.info("[SKIP] File size changing: %s", source.name)
         return False
 
     lock = acquire_lock(source)
     if lock is None:
-        logging.info("[LOCK] Another process holds the lock for %s — skipping.", source.name)
+        logging.info("[LOCK] Locked by another process: %s", source.name)
         return False
     _CURRENT_LOCK = lock
 
@@ -866,7 +826,7 @@ def process_file(source: Path, work_dir: Path, delete_source: bool = True) -> bo
         info = ffprobe_json(source)
         duration = get_duration(info)
         if duration <= 0:
-            logging.error("[META] Cannot determine duration for %s — skipping.", source.name)
+            logging.error("[META] No duration: %s", source.name)
             log_summary["status"] = "SKIP_NO_DURATION"
             return False
 
@@ -886,21 +846,14 @@ def process_file(source: Path, work_dir: Path, delete_source: bool = True) -> bo
         if quality["should_warn"]:
             logging.warning("[QUALITY] %s", quality["message"])
 
-        if quality["category"] in ("compressed", "heavily_compressed") and \
-           log_summary["original_size"] <= THRESHOLD_BYTES:
-            logging.info(
-                "[QUALITY] Source is already compressed and under threshold. "
-                "Consider using -c copy instead of re-encoding."
-            )
+        if quality["category"] in ("compressed", "heavily_compressed") and log_summary["original_size"] <= THRESHOLD_BYTES:
+            logging.info("[QUALITY] Already compressed and under threshold -- consider -c copy")
 
         current_video_kbps = calculate_target_bitrate(duration, audio_kbps)
         log_summary["target_video_kbps"] = current_video_kbps
 
         if current_video_kbps < 200:
-            logging.warning(
-                "[BITRATE] Very low target bitrate (%dkbps). Quality will be poor.",
-                current_video_kbps,
-            )
+            logging.warning("[BITRATE] Very low target bitrate (%dkbps). Quality will be poor.", current_video_kbps)
 
         sample_path = temp_dir / f"{source.stem}_sample_{os.getpid()}.mkv"
         _CURRENT_TEMPS.append(sample_path)
@@ -927,10 +880,7 @@ def process_file(source: Path, work_dir: Path, delete_source: bool = True) -> bo
             logging.warning("[FEASIBILITY] %s", feasibility["quality_warning"])
 
         if not feasibility["can_reach_target"]:
-            logging.error(
-                "[FEASIBILITY] Target size likely impossible. "
-                "Will attempt encoding but may need resolution reduction."
-            )
+            logging.error("[FEASIBILITY] Target likely impossible -- will try anyway")
 
         cleanup_paths([sample_path])
         if sample_path in _CURRENT_TEMPS:
@@ -941,11 +891,12 @@ def process_file(source: Path, work_dir: Path, delete_source: bool = True) -> bo
         output_path = source.with_name(f"{new_stem}{ext}")
         temp_output = source.with_name(f"{new_stem}.tmp{ext}")
         stderr_path = temp_dir / f"encode_stderr_{os.getpid()}.txt"
-        passlogfile = temp_dir / f"x264_2pass_{os.getpid()}"
+        passlogfile = source.with_name(f".x264_pass_{source.stem}_{os.getpid()}")
 
         _CURRENT_OUTPUT = output_path
         _CURRENT_TEMPS.append(temp_output)
         _CURRENT_TEMPS.append(stderr_path)
+        _CURRENT_TEMPS.append(passlogfile)
 
         scale_filter: Optional[str] = None
         retries_done = 0
@@ -968,7 +919,7 @@ def process_file(source: Path, work_dir: Path, delete_source: bool = True) -> bo
                 )
             except subprocess.CalledProcessError:
                 if has_subs and retries_done == 0 and scale_filter is None:
-                    logging.warning("[ENCODE] First attempt failed — retrying without subtitles...")
+                    logging.warning("[ENCODE] Failed -- retrying without subtitles...")
                     try:
                         two_pass_encode_with_progress(
                             source=source,
@@ -997,16 +948,13 @@ def process_file(source: Path, work_dir: Path, delete_source: bool = True) -> bo
             try:
                 ffprobe_json(temp_output)
             except Exception as exc:
-                logging.error("[VERIFY] ffprobe sanity check failed: %s", exc)
+                logging.error("[VERIFY] ffprobe failed: %s", exc)
                 log_summary["status"] = "FAIL_FFPROBE_SANITY"
                 return False
 
             if output_size <= THRESHOLD_BYTES:
-                success = output_size <= TARGET_BYTES
-                log_summary["status"] = "SUCCESS" if success else "ACCEPTABLE"
-                logging.info("[VERIFY] Output: %s — %s",
-                             format_size(output_size),
-                             "under target" if success else "under threshold but over target")
+                log_summary["status"] = "SUCCESS" if output_size <= TARGET_BYTES else "ACCEPTABLE"
+                logging.info("[VERIFY] Output: %s", format_size(output_size))
                 break
 
             retries_done += 1
@@ -1014,13 +962,11 @@ def process_file(source: Path, work_dir: Path, delete_source: bool = True) -> bo
 
             if retries_done <= MAX_RETRIES:
                 logging.warning(
-                    "[RETRY %d/%d] Output oversize: %s > %s",
+                    "[RETRY %d/%d] Oversize: %s > %s",
                     retries_done, MAX_RETRIES,
                     format_size(output_size), format_size(THRESHOLD_BYTES),
                 )
-                current_video_kbps = calculate_retry_bitrate(
-                    current_video_kbps, output_size, TARGET_BYTES,
-                )
+                current_video_kbps = calculate_retry_bitrate(current_video_kbps, output_size, TARGET_BYTES)
                 log_summary["target_video_kbps"] = current_video_kbps
                 try:
                     temp_output.unlink()
@@ -1028,10 +974,7 @@ def process_file(source: Path, work_dir: Path, delete_source: bool = True) -> bo
                     pass
             else:
                 if width > 1280 and height > 720 and not log_summary["resolution_reduced"]:
-                    logging.warning(
-                        "[FALLBACK] Max retries exceeded. Attempting resolution reduction %dx%d → 1280x720",
-                        width, height,
-                    )
+                    logging.warning("[FALLBACK] Reducing resolution %dx%d -> 1280x720", width, height)
                     scale_filter = "scale=1280:720"
                     log_summary["resolution_reduced"] = True
                     retries_done = 0
@@ -1042,17 +985,15 @@ def process_file(source: Path, work_dir: Path, delete_source: bool = True) -> bo
                     except OSError:
                         pass
                 else:
-                    logging.error(
-                        "[FALLBACK] Resolution already reduced or source is 720p or lower. "
-                        "Cannot achieve target size. Skipping."
-                    )
+                    logging.error("[FALLBACK] Cannot reach target size")
                     log_summary["status"] = "FAIL_CANNOT_REACH_TARGET"
                     return False
 
         if output_size <= THRESHOLD_BYTES:
             temp_output.rename(output_path)
             encoding_success = True
-            logging.info("[VERIFY] %s → %s", temp_output.name, output_path.name)
+            clear_fail_marker(source)
+            logging.info("[DONE] %s -> %s (%s)", source.name, output_path.name, format_size(output_size))
 
             if delete_source:
                 try:
@@ -1060,21 +1001,15 @@ def process_file(source: Path, work_dir: Path, delete_source: bool = True) -> bo
                     logging.info("[CLEANUP] Deleted source: %s", source.name)
                 except OSError as exc:
                     failed_name = source.with_name(f"{source.stem}_DELETE_FAILED{source.suffix}")
-                    logging.critical(
-                        "[CLEANUP] Cannot delete %s: %s — renaming to %s",
-                        source.name, exc, failed_name.name,
-                    )
+                    logging.critical("[CLEANUP] Cannot delete %s: %s", source.name, exc)
                     try:
                         source.rename(failed_name)
                     except OSError as exc2:
-                        logging.critical("[CLEANUP] Rename also failed: %s", exc2)
+                        logging.critical("[CLEANUP] Rename failed: %s", exc2)
                     log_summary["status"] = "FAIL_SOURCE_DELETE"
                     encoding_success = False
                     return False
 
-            logging.info("[DONE] %s → %s (%s)",
-                         source.name, output_path.name,
-                         format_size(output_size))
             return True
         else:
             log_summary["status"] = "OVERSIZE"
@@ -1087,30 +1022,35 @@ def process_file(source: Path, work_dir: Path, delete_source: bool = True) -> bo
     except subprocess.CalledProcessError as exc:
         logging.error("[FFMPEG ERROR] %s", exc.stderr[:2000] if exc.stderr else "no stderr")
         log_summary["status"] = "FFMPEG_ERROR"
+        set_fail_marker(source)
         return False
 
     except Exception as exc:
         logging.error("[ERROR] %s: %s", type(exc).__name__, exc)
         log_summary["status"] = f"ERROR:{type(exc).__name__}"
+        set_fail_marker(source)
         return False
 
     finally:
         if not encoding_success and temp_output and temp_output.exists():
             try:
                 temp_output.unlink()
-                logging.info("[CLEANUP] Removed partial output: %s", temp_output.name)
             except OSError:
                 pass
 
-        for suffix in ("-0.log", "-0.log.mbtree"):
-            pl = temp_dir / f"x264_2pass_{os.getpid()}{suffix}"
-            cleanup_paths([pl])
+        for p in list(_CURRENT_TEMPS):
+            for suffix in ("-0.log", "-0.log.mbtree"):
+                pl = Path(f"{p}{suffix}")
+                cleanup_paths([pl])
 
         cleanup_paths(_CURRENT_TEMPS)
         release_lock(lock)
         _CURRENT_LOCK = None
         _CURRENT_TEMPS = []
         _CURRENT_OUTPUT = None
+
+        if not encoding_success:
+            set_fail_marker(source)
 
         logging.info(
             "[SUMMARY] %s | orig=%s | quality=%s | video_kbps=%s | est_crf=%s | "
@@ -1150,7 +1090,7 @@ def main() -> int:
                     groups[path.parent].append(path)
 
             if not groups:
-                logging.info("[PASS %d] No qualifying files. Done.", pass_number)
+                logging.info("[PASS %d] No files. Done.", pass_number)
                 break
 
             batch_targets = defaultdict(list)
@@ -1161,8 +1101,9 @@ def main() -> int:
 
                 if is_single:
                     vid = vids[0]
-                    if is_locked(vid):
-                        logging.info("[SCAN] Skipping locked: %s", vid.name)
+                    if is_locked(vid) or has_fail_marker(vid):
+                        if has_fail_marker(vid):
+                            logging.info("[SCAN] Skipping failed: %s", vid.name)
                         continue
                     if get_file_size(vid) > THRESHOLD_BYTES:
                         batch_targets[parent].append(vid)
@@ -1172,8 +1113,9 @@ def main() -> int:
                     for vid in vids:
                         if get_file_size(vid) <= THRESHOLD_BYTES:
                             continue
-                        if is_locked(vid):
-                            logging.info("[SCAN] Skipping locked: %s", vid.name)
+                        if is_locked(vid) or has_fail_marker(vid):
+                            if has_fail_marker(vid):
+                                logging.info("[SCAN] Skipping failed: %s", vid.name)
                             continue
                         batch_targets[parent].append(vid)
 
@@ -1183,7 +1125,7 @@ def main() -> int:
                 safe_move(fpath, work_dir)
 
             if not batch_targets:
-                logging.info("[PASS %d] No qualifying files to encode. Done.", pass_number)
+                logging.info("[PASS %d] Nothing to encode. Done.", pass_number)
                 break
 
             total_files = sum(len(v) for v in batch_targets.values())
@@ -1210,14 +1152,11 @@ def main() -> int:
                             logging.info("[CLEANUP] Deleted source: %s", src.name)
                         except OSError as exc:
                             failed_name = src.with_name(f"{src.stem}_DELETE_FAILED{src.suffix}")
-                            logging.critical(
-                                "[CLEANUP] Cannot delete %s: %s — renaming to %s",
-                                src.name, exc, failed_name.name,
-                            )
+                            logging.critical("[CLEANUP] Cannot delete %s: %s", src.name, exc)
                             try:
                                 src.rename(failed_name)
                             except OSError as exc2:
-                                logging.critical("[CLEANUP] Rename also failed: %s", exc2)
+                                logging.critical("[CLEANUP] Rename failed: %s", exc2)
                 else:
                     if len(success_vids) == len(large_vids):
                         for src in success_vids:
@@ -1226,22 +1165,19 @@ def main() -> int:
                                 logging.info("[CLEANUP] Deleted source: %s", src.name)
                             except OSError as exc:
                                 failed_name = src.with_name(f"{src.stem}_DELETE_FAILED{src.suffix}")
-                                logging.critical(
-                                    "[CLEANUP] Cannot delete %s: %s — renaming to %s",
-                                    src.name, exc, failed_name.name,
-                                )
+                                logging.critical("[CLEANUP] Cannot delete %s: %s", src.name, exc)
                                 try:
                                     src.rename(failed_name)
                                 except OSError as exc2:
-                                    logging.critical("[CLEANUP] Rename also failed: %s", exc2)
+                                    logging.critical("[CLEANUP] Rename failed: %s", exc2)
                     else:
                         logging.warning(
-                            "[BATCH] Folder %s: Only %d/%d encoded successfully. Keeping originals.",
+                            "[BATCH] %s: Only %d/%d encoded. Keeping originals.",
                             parent, len(success_vids), len(large_vids),
                         )
 
     except KeyboardInterrupt:
-        logging.info("[SHUTDOWN] Interrupted. Cleaning up.")
+        logging.info("[SHUTDOWN] Interrupted.")
         cleanup_paths(_CURRENT_TEMPS)
         if _CURRENT_OUTPUT and _CURRENT_OUTPUT.exists() and _CURRENT_OUTPUT in _CURRENT_TEMPS:
             try:
