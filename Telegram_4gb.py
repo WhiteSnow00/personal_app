@@ -13,7 +13,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-__version__ = "1.0.1"
+__version__ = "1.0.2"
 
 THRESHOLD_BYTES = 4 * 1024 ** 3
 TARGET_BYTES = 3800 * 1024 ** 2
@@ -115,6 +115,8 @@ def format_time(seconds: float) -> str:
 
 
 def is_pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
     try:
         os.kill(pid, 0)
     except OSError:
@@ -591,7 +593,6 @@ def build_ffmpeg_video_args(video_kbps: int, scale: Optional[str] = None) -> Lis
         "-c:v", ENCODE_CODEC,
         "-preset", PRESET,
         "-b:v", f"{video_kbps}k",
-        "-minrate", f"{int(video_kbps * 0.5)}k",
         "-maxrate", f"{int(video_kbps * 1.5)}k",
         "-bufsize", f"{int(video_kbps * 2)}k",
     ]
@@ -686,7 +687,7 @@ def two_pass_encode_with_progress(
                         pass
                 elif line.startswith("out_time_ms="):
                     try:
-                        out_time_ms = int(line.split("=", 1)[1])
+                        out_time_ms = int(line.split("=", 1)[1]) // 1000
                     except ValueError:
                         pass
                 elif line.startswith("fps="):
@@ -716,10 +717,17 @@ def two_pass_encode_with_progress(
                     last_print = now
 
         finally:
-            if process.poll() is None:
-                process.terminate()
+            if _INTERRUPTED:
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+            else:
                 try:
-                    process.wait(timeout=10)
+                    process.wait(timeout=ENCODE_TIMEOUT)
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait()
@@ -974,8 +982,8 @@ def process_file(source: Path, work_dir: Path, delete_source: bool = True) -> bo
                     pass
             else:
                 if width > 1280 and height > 720 and not log_summary["resolution_reduced"]:
-                    logging.warning("[FALLBACK] Reducing resolution %dx%d -> 1280x720", width, height)
-                    scale_filter = "scale=1280:720"
+                    logging.warning("[FALLBACK] Reducing resolution %dx%d -> fit 1280x720", width, height)
+                    scale_filter = "scale='min(1280,iw)':'min(720,ih)':force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2"
                     log_summary["resolution_reduced"] = True
                     retries_done = 0
                     current_video_kbps = calculate_target_bitrate(duration, audio_kbps)
@@ -1049,7 +1057,7 @@ def process_file(source: Path, work_dir: Path, delete_source: bool = True) -> bo
         _CURRENT_TEMPS = []
         _CURRENT_OUTPUT = None
 
-        if not encoding_success:
+        if not encoding_success and not _INTERRUPTED:
             set_fail_marker(source)
 
         logging.info(
