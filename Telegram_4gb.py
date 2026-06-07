@@ -3,6 +3,7 @@ import json
 import logging
 import math
 import os
+import hashlib
 import shutil
 import signal
 import subprocess
@@ -30,6 +31,8 @@ ENCODE_CODEC = "libx264"
 
 ENCODE_TIMEOUT = 86400
 FAIL_MARKER_SUFFIX = ".encode_fail"
+STATE_DIR_NAME = ".encode_state"
+MAX_FILENAME_BYTES = 240
 
 CODEC_EFFICIENCY = {
     "h264": 1.0,
@@ -122,6 +125,69 @@ def format_time(seconds: float) -> str:
     return f"{m:02d}:{s:02d}"
 
 
+def short_token(value: Any, length: int = 12) -> str:
+    data = str(value).encode("utf-8", "surrogatepass")
+    return hashlib.sha1(data).hexdigest()[:length]
+
+
+def path_token(path: Path) -> str:
+    try:
+        key = str(path.resolve())
+    except OSError:
+        key = str(path)
+    return short_token(key)
+
+
+def utf8_len(text: str) -> int:
+    return len(text.encode("utf-8", "surrogatepass"))
+
+
+def truncate_utf8(text: str, max_bytes: int) -> str:
+    if max_bytes <= 0:
+        return ""
+    if utf8_len(text) <= max_bytes:
+        return text
+
+    result: List[str] = []
+    used = 0
+    for char in text:
+        char_len = utf8_len(char)
+        if used + char_len > max_bytes:
+            break
+        result.append(char)
+        used += char_len
+    return "".join(result)
+
+
+def safe_filename(stem: str, suffix: str, max_bytes: int = MAX_FILENAME_BYTES) -> str:
+    raw = f"{stem}{suffix}"
+    if utf8_len(raw) <= max_bytes:
+        return raw
+
+    digest = short_token(raw, 10)
+    suffix_with_digest = f"_{digest}{suffix}"
+    stem_budget = max_bytes - utf8_len(suffix_with_digest)
+    short_stem = truncate_utf8(stem, stem_budget).rstrip(" ._-")
+    if not short_stem:
+        short_stem = "video"
+    return f"{short_stem}{suffix_with_digest}"
+
+
+def safe_path_exists(path: Path) -> bool:
+    try:
+        return path.exists()
+    except OSError:
+        return False
+
+
+def state_dir_for(video_path: Path) -> Path:
+    return video_path.parent / STATE_DIR_NAME
+
+
+def state_path_for(video_path: Path, suffix: str) -> Path:
+    return state_dir_for(video_path) / f"{path_token(video_path)}{suffix}"
+
+
 def is_pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
@@ -135,7 +201,7 @@ def is_pid_alive(pid: int) -> bool:
 def cleanup_paths(paths: List[Path]) -> None:
     for p in paths:
         try:
-            if p.exists():
+            if safe_path_exists(p):
                 p.unlink()
                 logging.debug("Cleaned up: %s", p)
         except OSError as exc:
@@ -143,36 +209,42 @@ def cleanup_paths(paths: List[Path]) -> None:
 
 
 def fail_marker_path(video_path: Path) -> Path:
+    return state_path_for(video_path, FAIL_MARKER_SUFFIX)
+
+
+def legacy_fail_marker_path(video_path: Path) -> Path:
     return video_path.with_suffix(video_path.suffix + FAIL_MARKER_SUFFIX)
 
 
 def has_fail_marker(video_path: Path) -> bool:
-    return fail_marker_path(video_path).exists()
+    return safe_path_exists(fail_marker_path(video_path)) or safe_path_exists(legacy_fail_marker_path(video_path))
 
 
 def set_fail_marker(video_path: Path) -> None:
     try:
-        fail_marker_path(video_path).write_text(str(int(time.time())))
-    except OSError:
-        pass
+        marker = fail_marker_path(video_path)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(f"{int(time.time())}\n{video_path.name}\n", encoding="utf-8")
+    except OSError as exc:
+        logging.warning("[MARKER] Failed to write fail marker for %s: %s", video_path.name, exc)
 
 
 def clear_fail_marker(video_path: Path) -> None:
-    try:
-        p = fail_marker_path(video_path)
-        if p.exists():
-            p.unlink()
-    except OSError:
-        pass
+    for p in (fail_marker_path(video_path), legacy_fail_marker_path(video_path)):
+        try:
+            if safe_path_exists(p):
+                p.unlink()
+        except OSError:
+            pass
 
 
 def lock_path_for(video_path: Path) -> Path:
-    return video_path.with_suffix(video_path.suffix + ".lock")
+    return state_path_for(video_path, ".lock")
 
 
 def is_locked(video_path: Path) -> bool:
     lock = lock_path_for(video_path)
-    if not lock.exists():
+    if not safe_path_exists(lock):
         return False
     try:
         pid = int(lock.read_text().strip())
@@ -194,6 +266,11 @@ def is_locked(video_path: Path) -> bool:
 def acquire_lock(video_path: Path) -> Optional[Path]:
     lock = lock_path_for(video_path)
     pid = os.getpid()
+    try:
+        lock.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        logging.warning("[LOCK] Failed to create state dir for %s: %s", video_path.name, exc)
+        return None
     for _ in range(2):
         try:
             fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
@@ -219,7 +296,7 @@ def acquire_lock(video_path: Path) -> Optional[Path]:
 
 def release_lock(lock: Path) -> None:
     try:
-        if lock.exists():
+        if safe_path_exists(lock):
             lock.unlink()
     except OSError as exc:
         logging.warning("Failed to release lock %s: %s", lock, exc)
@@ -325,9 +402,11 @@ def is_temporary_video(path: Path) -> bool:
 
 
 def final_output_path_for(source: Path, work_dir: Path) -> Path:
-    desired = work_dir / f"{source.stem}{FINAL_OUTPUT_SUFFIX}.mp4"
+    desired = work_dir / safe_filename(source.stem, f"{FINAL_OUTPUT_SUFFIX}.mp4")
     try:
         if not desired.exists() or desired.resolve() == source.resolve():
+            if desired.stem != f"{source.stem}{FINAL_OUTPUT_SUFFIX}":
+                logging.warning("[OUTPUT] Source name too long; using shortened output name: %s", desired.name)
             return desired
     except OSError:
         if not desired.exists():
@@ -335,7 +414,7 @@ def final_output_path_for(source: Path, work_dir: Path) -> Path:
 
     counter = 2
     while True:
-        candidate = work_dir / f"{source.stem}{FINAL_OUTPUT_SUFFIX}_{counter}.mp4"
+        candidate = work_dir / safe_filename(source.stem, f"{FINAL_OUTPUT_SUFFIX}_{counter}.mp4")
         if not candidate.exists():
             logging.warning("[OUTPUT] %s exists; using %s", desired.name, candidate.name)
             return candidate
@@ -343,7 +422,7 @@ def final_output_path_for(source: Path, work_dir: Path) -> Path:
 
 
 def temp_output_path_for(output_path: Path, label: str) -> Path:
-    return output_path.with_name(f".{output_path.stem}_{label}_{os.getpid()}.tmp.mp4")
+    return output_path.with_name(f".tg4gb_{label}_{os.getpid()}_{path_token(output_path)}.tmp.mp4")
 
 
 def verify_mp4_output(path: Path) -> int:
@@ -498,6 +577,7 @@ def extract_sample(source: Path, output: Path, duration: float) -> None:
     local_temps: List[Path] = []
     clips: List[Path] = []
     percentages = [0.10, 0.30, 0.50, 0.70, 0.90]
+    token = path_token(source)
 
     try:
         for idx, pct in enumerate(percentages, start=1):
@@ -505,7 +585,7 @@ def extract_sample(source: Path, output: Path, duration: float) -> None:
             if start + SAMPLE_CLIP_DURATION > duration:
                 start = max(0.0, duration - SAMPLE_CLIP_DURATION)
 
-            clip_path = temp_dir / f"{source.stem}_clip{idx}_{os.getpid()}.mkv"
+            clip_path = temp_dir / f"tg4gb_{token}_clip{idx}_{os.getpid()}.mkv"
             clips.append(clip_path)
             local_temps.append(clip_path)
 
@@ -522,7 +602,7 @@ def extract_sample(source: Path, output: Path, duration: float) -> None:
             logging.info("[SAMPLE] Clip %d/%d @ %.1fs (ultrafast)", idx, SAMPLE_CLIP_COUNT, start)
             run_cmd(cmd, timeout=120)
 
-        list_path = temp_dir / f"{source.stem}_concat_list_{os.getpid()}.txt"
+        list_path = temp_dir / f"tg4gb_{token}_concat_{os.getpid()}.txt"
         local_temps.append(list_path)
 
         list_lines = []
@@ -883,7 +963,7 @@ def delete_source_file(source: Path) -> bool:
         logging.info("[CLEANUP] Deleted source: %s", source.name)
         return True
     except OSError as exc:
-        failed_name = source.with_name(f"{source.stem}_DELETE_FAILED{source.suffix}")
+        failed_name = source.with_name(safe_filename(source.stem, f"_DELETE_FAILED{source.suffix}"))
         logging.critical("[CLEANUP] Cannot delete %s: %s", source.name, exc)
         try:
             source.rename(failed_name)
@@ -1069,7 +1149,8 @@ def process_file(source: Path, work_dir: Path, delete_source: bool = True) -> bo
         if current_video_kbps < 200:
             logging.warning("[BITRATE] Very low target bitrate (%dkbps). Quality will be poor.", current_video_kbps)
 
-        sample_path = temp_dir / f"{source.stem}_sample_{os.getpid()}.mkv"
+        source_token = path_token(source)
+        sample_path = temp_dir / f"tg4gb_{source_token}_sample_{os.getpid()}.mkv"
         _CURRENT_TEMPS.append(sample_path)
 
         if _INTERRUPTED:
@@ -1103,7 +1184,7 @@ def process_file(source: Path, work_dir: Path, delete_source: bool = True) -> bo
         log_summary["action"] = log_summary["action"] or "ENCODE"
         temp_output = temp_output_path_for(output_path, "encode")
         stderr_path = temp_dir / f"encode_stderr_{os.getpid()}.txt"
-        passlogfile = work_dir / f".x264_pass_{source.stem}_{os.getpid()}"
+        passlogfile = work_dir / f".x264_pass_{source_token}_{os.getpid()}"
 
         _CURRENT_TEMPS.append(temp_output)
         _CURRENT_TEMPS.append(stderr_path)
