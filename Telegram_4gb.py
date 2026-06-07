@@ -9,11 +9,10 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-__version__ = "1.0.2"
+__version__ = "1.1.0"
 
 THRESHOLD_BYTES = 4 * 1024 ** 3
 TARGET_BYTES = 3800 * 1024 ** 2
@@ -44,7 +43,16 @@ CODEC_EFFICIENCY = {
     "mpeg2video": 0.5,
 }
 
-SUPPORTED_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm"}
+SUPPORTED_EXTS = {
+    ".3g2", ".3gp", ".asf", ".avi", ".divx", ".dv", ".f4v", ".flv",
+    ".m2t", ".m2ts", ".m4v", ".mkv", ".mov", ".mp4", ".mpeg", ".mpg",
+    ".mts", ".mxf", ".ogm", ".ogv", ".rm", ".rmvb", ".ts", ".vob",
+    ".webm", ".wmv",
+}
+FINAL_OUTPUT_SUFFIX = "_encoded"
+H264_VIDEO_CODECS = {"h264", "avc", "avc1", "avc3"}
+MP4_AUDIO_COPY_CODECS = {"aac", "alac", "mp3", "ac3", "eac3", "opus"}
+MP4_SUBTITLE_COPY_CODECS = {"mov_text", "tx3g", "webvtt"}
 
 _CURRENT_TEMPS: List[Path] = []
 _CURRENT_OUTPUT: Optional[Path] = None
@@ -260,11 +268,93 @@ def has_subtitle_streams(info: dict) -> bool:
     return any(s.get("codec_type") == "subtitle" for s in info.get("streams", []))
 
 
+def get_stream_codecs(info: dict, codec_type: str) -> List[str]:
+    codecs: List[str] = []
+    for stream in info.get("streams", []):
+        if stream.get("codec_type") == codec_type:
+            codecs.append(str(stream.get("codec_name", "unknown")).lower())
+    return codecs
+
+
 def get_audio_codec(info: dict) -> str:
     audio = get_audio_stream(info)
     if audio is None:
         return "none"
     return audio.get("codec_name", "unknown")
+
+
+def get_audio_codecs(info: dict) -> List[str]:
+    return get_stream_codecs(info, "audio")
+
+
+def get_subtitle_codecs(info: dict) -> List[str]:
+    return get_stream_codecs(info, "subtitle")
+
+
+def is_h264_video_codec(codec_name: str) -> bool:
+    return codec_name.lower() in H264_VIDEO_CODECS
+
+
+def can_copy_audio_to_mp4(info: dict) -> bool:
+    audio_codecs = get_audio_codecs(info)
+    return not audio_codecs or all(codec in MP4_AUDIO_COPY_CODECS for codec in audio_codecs)
+
+
+def can_copy_subtitles_to_mp4(info: dict) -> bool:
+    subtitle_codecs = get_subtitle_codecs(info)
+    return not subtitle_codecs or all(codec in MP4_SUBTITLE_COPY_CODECS for codec in subtitle_codecs)
+
+
+def is_generated_output(path: Path) -> bool:
+    if path.suffix.lower() != ".mp4":
+        return False
+    stem = path.stem.lower()
+    suffix = FINAL_OUTPUT_SUFFIX.lower()
+    if stem.endswith(suffix):
+        return True
+    marker = f"{suffix}_"
+    if marker in stem:
+        tail = stem.rsplit(marker, 1)[1]
+        return tail.isdigit()
+    return False
+
+
+def is_temporary_video(path: Path) -> bool:
+    name = path.name.lower()
+    return name.endswith(".tmp.mp4") or ".tmp." in name
+
+
+def final_output_path_for(source: Path, work_dir: Path) -> Path:
+    desired = work_dir / f"{source.stem}{FINAL_OUTPUT_SUFFIX}.mp4"
+    try:
+        if not desired.exists() or desired.resolve() == source.resolve():
+            return desired
+    except OSError:
+        if not desired.exists():
+            return desired
+
+    counter = 2
+    while True:
+        candidate = work_dir / f"{source.stem}{FINAL_OUTPUT_SUFFIX}_{counter}.mp4"
+        if not candidate.exists():
+            logging.warning("[OUTPUT] %s exists; using %s", desired.name, candidate.name)
+            return candidate
+        counter += 1
+
+
+def temp_output_path_for(output_path: Path, label: str) -> Path:
+    return output_path.with_name(f".{output_path.stem}_{label}_{os.getpid()}.tmp.mp4")
+
+
+def verify_mp4_output(path: Path) -> int:
+    if path.suffix.lower() != ".mp4":
+        raise ValueError(f"Output is not MP4: {path.name}")
+    if not path.exists() or get_file_size(path) <= 0:
+        raise ValueError(f"Output missing or empty: {path.name}")
+    info = ffprobe_json(path)
+    if get_video_stream(info) is None:
+        raise ValueError(f"Output has no video stream: {path.name}")
+    return get_file_size(path)
 
 
 def get_audio_bitrate(info: dict) -> int:
@@ -606,7 +696,7 @@ def two_pass_encode_with_progress(
     output: Path,
     video_kbps: int,
     total_duration_sec: float,
-    audio_codec: str,
+    audio_codecs: List[str],
     has_subs: bool,
     stderr_path: Path,
     passlogfile: Path,
@@ -614,20 +704,22 @@ def two_pass_encode_with_progress(
 ) -> None:
     video_args = build_ffmpeg_video_args(video_kbps, scale)
     passlog_prefix = str(passlogfile)
+    audio_label = ",".join(audio_codecs) if audio_codecs else "none"
 
-    if audio_codec in ("aac", "none", "unknown"):
+    if not audio_codecs or all(codec in MP4_AUDIO_COPY_CODECS for codec in audio_codecs):
         audio_args = ["-c:a", "copy"]
     else:
         audio_args = ["-c:a", "aac", "-b:a", f"{AUDIO_BITRATE_KBPS}k"]
-        logging.info("[ENCODE] Re-encoding audio %s -> AAC %dkbps", audio_codec, AUDIO_BITRATE_KBPS)
+        logging.info("[ENCODE] Re-encoding audio %s -> AAC %dkbps", audio_label, AUDIO_BITRATE_KBPS)
 
-    sub_args: List[str] = ["-c:s", "copy"] if has_subs else ["-sn"]
+    sub_args: List[str] = ["-sn"]
+    input_maps = ["-map", "0:v:0", "-map", "0:a?"]
 
     logging.info("[ENCODE] Pass 1/2 -- analysis")
     pass1_cmd = [
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
         "-i", str(source),
-        "-map", "0",
+        "-map", "0:v:0",
     ] + video_args + [
         "-pass", "1",
         "-passlogfile", passlog_prefix,
@@ -647,13 +739,13 @@ def two_pass_encode_with_progress(
     pass2_cmd = [
         "ffmpeg", "-y", "-hide_banner",
         "-i", str(source),
-        "-map", "0",
-    ] + video_args + [
+    ] + input_maps + video_args + [
         "-pass", "2",
         "-passlogfile", passlog_prefix,
     ] + audio_args + sub_args + [
         "-map_metadata", "0",
         "-dn",
+        "-movflags", "+faststart",
         "-progress", "pipe:1",
         "-nostats",
         str(output),
@@ -785,6 +877,56 @@ def safe_move(src: Path, dest_dir: Path) -> None:
         logging.error("[MOVE] Failed to move %s: %s", src.name, e)
 
 
+def delete_source_file(source: Path) -> bool:
+    try:
+        source.unlink()
+        logging.info("[CLEANUP] Deleted source: %s", source.name)
+        return True
+    except OSError as exc:
+        failed_name = source.with_name(f"{source.stem}_DELETE_FAILED{source.suffix}")
+        logging.critical("[CLEANUP] Cannot delete %s: %s", source.name, exc)
+        try:
+            source.rename(failed_name)
+        except OSError as exc2:
+            logging.critical("[CLEANUP] Rename failed: %s", exc2)
+        return False
+
+
+def fast_remux_to_mp4(source: Path, temp_output: Path, info: dict) -> int:
+    cleanup_paths([temp_output])
+
+    cmd = [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        "-i", str(source),
+        "-map", "0:v:0",
+        "-map", "0:a?",
+    ]
+
+    if has_subtitle_streams(info):
+        cmd += ["-map", "0:s?"]
+
+    cmd += [
+        "-c:v", "copy",
+        "-c:a", "copy",
+        "-sn",
+    ]
+
+    cmd += [
+        "-map_metadata", "0",
+        "-dn",
+        "-movflags", "+faststart",
+        str(temp_output),
+    ]
+
+    logging.info("[REMUX] Fast MP4 remux with stream copy")
+    try:
+        run_cmd(cmd, timeout=ENCODE_TIMEOUT)
+        return verify_mp4_output(temp_output)
+    except Exception:
+        cleanup_paths([temp_output])
+        raise
+
+
 def process_file(source: Path, work_dir: Path, delete_source: bool = True) -> bool:
     global _CURRENT_TEMPS, _CURRENT_OUTPUT, _CURRENT_LOCK
 
@@ -812,6 +954,9 @@ def process_file(source: Path, work_dir: Path, delete_source: bool = True) -> bo
     log_summary = {
         "source": str(source.name),
         "original_size": get_file_size(source),
+        "video_codec": None,
+        "audio_codecs": None,
+        "action": None,
         "source_quality": None,
         "target_video_kbps": None,
         "probe_estimated_crf": None,
@@ -838,16 +983,77 @@ def process_file(source: Path, work_dir: Path, delete_source: bool = True) -> bo
             log_summary["status"] = "SKIP_NO_DURATION"
             return False
 
+        video_stream = get_video_stream(info)
+        if video_stream is None:
+            logging.error("[META] No video stream: %s", source.name)
+            log_summary["status"] = "SKIP_NO_VIDEO"
+            return False
+
         has_subs = has_subtitle_streams(info)
-        audio_codec = get_audio_codec(info)
+        audio_codecs = get_audio_codecs(info)
+        subtitle_codecs = get_subtitle_codecs(info)
+        video_codec = get_codec_name(info).lower()
         audio_kbps = get_audio_bitrate(info)
         width, height = get_resolution(info)
         fps = get_fps(info)
+        output_path = final_output_path_for(source, work_dir)
+        _CURRENT_OUTPUT = output_path
+        log_summary["video_codec"] = video_codec
+        log_summary["audio_codecs"] = ",".join(audio_codecs) if audio_codecs else "none"
 
         logging.info(
-            "[META] Duration=%.2fs | Res=%dx%d | FPS=%.2f | Audio=%s (%dkbps) | Subs=%s",
-            duration, width, height, fps, audio_codec, audio_kbps, has_subs,
+            "[META] Duration=%.2fs | Res=%dx%d | FPS=%.2f | Video=%s | Audio=%s (%dkbps) | Subs=%s",
+            duration,
+            width,
+            height,
+            fps,
+            video_codec,
+            ",".join(audio_codecs) if audio_codecs else "none",
+            audio_kbps,
+            ",".join(subtitle_codecs) if subtitle_codecs else "none",
         )
+
+        audio_copy_ok = can_copy_audio_to_mp4(info)
+        fast_remux_candidate = is_h264_video_codec(video_codec) and audio_copy_ok
+
+        if is_h264_video_codec(video_codec) and not audio_copy_ok:
+            logging.info("[REMUX] H264 source has non-MP4-copy-safe audio; using encode pipeline")
+
+        if fast_remux_candidate and log_summary["original_size"] <= THRESHOLD_BYTES:
+            temp_output = temp_output_path_for(output_path, "remux")
+            _CURRENT_TEMPS.append(temp_output)
+            log_summary["action"] = "FAST_REMUX"
+            try:
+                output_size = fast_remux_to_mp4(source, temp_output, info)
+                log_summary["output_size"] = output_size
+                temp_output.rename(output_path)
+                encoding_success = True
+                clear_fail_marker(source)
+                log_summary["status"] = "REMUX_SUCCESS"
+                logging.info("[DONE] %s -> %s (%s)", source.name, output_path.name, format_size(output_size))
+
+                if delete_source and not delete_source_file(source):
+                    log_summary["status"] = "FAIL_SOURCE_DELETE"
+                    encoding_success = False
+                    return False
+
+                return True
+            except subprocess.CalledProcessError as exc:
+                logging.warning("[REMUX] Failed; falling back to encode: %s", exc.stderr[:1000] if exc.stderr else "no stderr")
+                cleanup_paths([temp_output])
+                if temp_output in _CURRENT_TEMPS:
+                    _CURRENT_TEMPS.remove(temp_output)
+                temp_output = None
+                log_summary["action"] = "ENCODE_AFTER_REMUX_FAIL"
+            except Exception as exc:
+                logging.warning("[REMUX] Failed; falling back to encode: %s", exc)
+                cleanup_paths([temp_output])
+                if temp_output in _CURRENT_TEMPS:
+                    _CURRENT_TEMPS.remove(temp_output)
+                temp_output = None
+                log_summary["action"] = "ENCODE_AFTER_REMUX_FAIL"
+        elif fast_remux_candidate:
+            logging.info("[REMUX] H264 source is stream-copy compatible, but exceeds threshold; using encode pipeline")
 
         quality = analyze_source_quality(info)
         log_summary["source_quality"] = quality["category"]
@@ -855,7 +1061,7 @@ def process_file(source: Path, work_dir: Path, delete_source: bool = True) -> bo
             logging.warning("[QUALITY] %s", quality["message"])
 
         if quality["category"] in ("compressed", "heavily_compressed") and log_summary["original_size"] <= THRESHOLD_BYTES:
-            logging.info("[QUALITY] Already compressed and under threshold -- consider -c copy")
+            logging.info("[QUALITY] Already compressed and under threshold -- encode required for MP4 compatibility")
 
         current_video_kbps = calculate_target_bitrate(duration, audio_kbps)
         log_summary["target_video_kbps"] = current_video_kbps
@@ -894,14 +1100,11 @@ def process_file(source: Path, work_dir: Path, delete_source: bool = True) -> bo
         if sample_path in _CURRENT_TEMPS:
             _CURRENT_TEMPS.remove(sample_path)
 
-        ext = source.suffix
-        new_stem = f"{source.stem}_encoded"
-        output_path = source.with_name(f"{new_stem}{ext}")
-        temp_output = source.with_name(f"{new_stem}.tmp{ext}")
+        log_summary["action"] = log_summary["action"] or "ENCODE"
+        temp_output = temp_output_path_for(output_path, "encode")
         stderr_path = temp_dir / f"encode_stderr_{os.getpid()}.txt"
-        passlogfile = source.with_name(f".x264_pass_{source.stem}_{os.getpid()}")
+        passlogfile = work_dir / f".x264_pass_{source.stem}_{os.getpid()}"
 
-        _CURRENT_OUTPUT = output_path
         _CURRENT_TEMPS.append(temp_output)
         _CURRENT_TEMPS.append(stderr_path)
         _CURRENT_TEMPS.append(passlogfile)
@@ -919,7 +1122,7 @@ def process_file(source: Path, work_dir: Path, delete_source: bool = True) -> bo
                     output=temp_output,
                     video_kbps=current_video_kbps,
                     total_duration_sec=duration,
-                    audio_codec=audio_codec,
+                    audio_codecs=audio_codecs,
                     has_subs=has_subs,
                     stderr_path=stderr_path,
                     passlogfile=passlogfile,
@@ -934,7 +1137,7 @@ def process_file(source: Path, work_dir: Path, delete_source: bool = True) -> bo
                             output=temp_output,
                             video_kbps=current_video_kbps,
                             total_duration_sec=duration,
-                            audio_codec=audio_codec,
+                            audio_codecs=audio_codecs,
                             has_subs=False,
                             stderr_path=stderr_path,
                             passlogfile=passlogfile,
@@ -945,16 +1148,9 @@ def process_file(source: Path, work_dir: Path, delete_source: bool = True) -> bo
                 else:
                     raise
 
-            if not temp_output.exists() or get_file_size(temp_output) == 0:
-                logging.error("[VERIFY] Output missing or empty: %s", temp_output.name)
-                log_summary["status"] = "FAIL_EMPTY_OUTPUT"
-                return False
-
-            output_size = get_file_size(temp_output)
-            log_summary["output_size"] = output_size
-
             try:
-                ffprobe_json(temp_output)
+                output_size = verify_mp4_output(temp_output)
+                log_summary["output_size"] = output_size
             except Exception as exc:
                 logging.error("[VERIFY] ffprobe failed: %s", exc)
                 log_summary["status"] = "FAIL_FFPROBE_SANITY"
@@ -1004,16 +1200,7 @@ def process_file(source: Path, work_dir: Path, delete_source: bool = True) -> bo
             logging.info("[DONE] %s -> %s (%s)", source.name, output_path.name, format_size(output_size))
 
             if delete_source:
-                try:
-                    source.unlink()
-                    logging.info("[CLEANUP] Deleted source: %s", source.name)
-                except OSError as exc:
-                    failed_name = source.with_name(f"{source.stem}_DELETE_FAILED{source.suffix}")
-                    logging.critical("[CLEANUP] Cannot delete %s: %s", source.name, exc)
-                    try:
-                        source.rename(failed_name)
-                    except OSError as exc2:
-                        logging.critical("[CLEANUP] Rename failed: %s", exc2)
+                if not delete_source_file(source):
                     log_summary["status"] = "FAIL_SOURCE_DELETE"
                     encoding_success = False
                     return False
@@ -1061,9 +1248,12 @@ def process_file(source: Path, work_dir: Path, delete_source: bool = True) -> bo
             set_fail_marker(source)
 
         logging.info(
-            "[SUMMARY] %s | orig=%s | quality=%s | video_kbps=%s | est_crf=%s | "
-            "retries=%d | res_reduced=%s | out=%s | %s",
+            "[SUMMARY] %s | action=%s | vcodec=%s | acodec=%s | orig=%s | quality=%s | "
+            "video_kbps=%s | est_crf=%s | retries=%d | res_reduced=%s | out=%s | %s",
             log_summary["source"],
+            log_summary["action"] or "N/A",
+            log_summary["video_codec"] or "N/A",
+            log_summary["audio_codecs"] or "N/A",
             format_size(log_summary["original_size"]) if log_summary["original_size"] else "N/A",
             log_summary["source_quality"] or "N/A",
             str(log_summary["target_video_kbps"]) if log_summary["target_video_kbps"] else "N/A",
@@ -1092,97 +1282,33 @@ def main() -> int:
             logging.info("=" * 60)
             logging.info("[PASS %d] Scanning...", pass_number)
 
-            groups = defaultdict(list)
+            targets: List[Path] = []
             for path in sorted(work_dir.rglob("*")):
-                if path.is_file() and path.suffix.lower() in SUPPORTED_EXTS:
-                    groups[path.parent].append(path)
+                if not path.is_file():
+                    continue
+                if path.suffix.lower() not in SUPPORTED_EXTS:
+                    continue
+                if is_temporary_video(path) or is_generated_output(path):
+                    logging.info("[SCAN] Skipping generated/temp output: %s", path.name)
+                    continue
+                if is_locked(path):
+                    logging.info("[SCAN] Skipping locked: %s", path.name)
+                    continue
+                if has_fail_marker(path):
+                    logging.info("[SCAN] Skipping failed: %s", path.name)
+                    continue
+                targets.append(path)
 
-            if not groups:
+            if not targets:
                 logging.info("[PASS %d] No files. Done.", pass_number)
                 break
 
-            batch_targets = defaultdict(list)
-            single_small_moves = []
+            logging.info("[PASS %d] %d file(s) to process.", pass_number, len(targets))
 
-            for parent, vids in groups.items():
-                is_single = len(vids) == 1
-
-                if is_single:
-                    vid = vids[0]
-                    if is_locked(vid) or has_fail_marker(vid):
-                        if has_fail_marker(vid):
-                            logging.info("[SCAN] Skipping failed: %s", vid.name)
-                        continue
-                    if get_file_size(vid) > THRESHOLD_BYTES:
-                        batch_targets[parent].append(vid)
-                    elif parent != work_dir:
-                        single_small_moves.append(vid)
-                else:
-                    for vid in vids:
-                        if get_file_size(vid) <= THRESHOLD_BYTES:
-                            continue
-                        if is_locked(vid) or has_fail_marker(vid):
-                            if has_fail_marker(vid):
-                                logging.info("[SCAN] Skipping failed: %s", vid.name)
-                            continue
-                        batch_targets[parent].append(vid)
-
-            for fpath in single_small_moves:
+            for fpath in targets:
                 if _INTERRUPTED:
                     raise KeyboardInterrupt
-                safe_move(fpath, work_dir)
-
-            if not batch_targets:
-                logging.info("[PASS %d] Nothing to encode. Done.", pass_number)
-                break
-
-            total_files = sum(len(v) for v in batch_targets.values())
-            logging.info("[PASS %d] %d file(s) to process.", pass_number, total_files)
-
-            for parent, large_vids in batch_targets.items():
-                is_single = len(groups[parent]) == 1
-                success_vids = []
-
-                for fpath in large_vids:
-                    if _INTERRUPTED:
-                        raise KeyboardInterrupt
-                    success = process_file(fpath, work_dir, delete_source=False)
-                    if success:
-                        success_vids.append(fpath)
-
-                if is_single:
-                    for src in success_vids:
-                        out_path = src.with_name(f"{src.stem}_encoded{src.suffix}")
-                        if parent != work_dir:
-                            safe_move(out_path, work_dir)
-                        try:
-                            src.unlink()
-                            logging.info("[CLEANUP] Deleted source: %s", src.name)
-                        except OSError as exc:
-                            failed_name = src.with_name(f"{src.stem}_DELETE_FAILED{src.suffix}")
-                            logging.critical("[CLEANUP] Cannot delete %s: %s", src.name, exc)
-                            try:
-                                src.rename(failed_name)
-                            except OSError as exc2:
-                                logging.critical("[CLEANUP] Rename failed: %s", exc2)
-                else:
-                    if len(success_vids) == len(large_vids):
-                        for src in success_vids:
-                            try:
-                                src.unlink()
-                                logging.info("[CLEANUP] Deleted source: %s", src.name)
-                            except OSError as exc:
-                                failed_name = src.with_name(f"{src.stem}_DELETE_FAILED{src.suffix}")
-                                logging.critical("[CLEANUP] Cannot delete %s: %s", src.name, exc)
-                                try:
-                                    src.rename(failed_name)
-                                except OSError as exc2:
-                                    logging.critical("[CLEANUP] Rename failed: %s", exc2)
-                    else:
-                        logging.warning(
-                            "[BATCH] %s: Only %d/%d encoded. Keeping originals.",
-                            parent, len(success_vids), len(large_vids),
-                        )
+                process_file(fpath, work_dir, delete_source=True)
 
     except KeyboardInterrupt:
         logging.info("[SHUTDOWN] Interrupted.")
@@ -1202,7 +1328,6 @@ def main() -> int:
 
     logging.info("[SHUTDOWN] Finished.")
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())
