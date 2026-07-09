@@ -33,12 +33,16 @@ class Thresholds:
     MIN_RESOLUTION_PX: int = 480
     PHASH_BITS: int = 64
     DURATION_TOLERANCE_S: float = 1.0
-    MTIME_TOLERANCE_S: float = 2.0 
+    MTIME_TOLERANCE_S: float = 2.0
     PROGRESS_INTERVAL: int = 25
     COARSE_STEP: int = 5
     COARSE_THRESHOLD: int = 200
-    DURATION_PADDING_S: int = 60
+
+    DURATION_PADDING_S: float = 60.0
+    DURATION_PADDING_RATIO: float = 0.12
     FRAME_SIZE: int = 32
+
+    CACHE_SCHEMA_VERSION: int = 2
 
 try:
     import imagehash
@@ -227,7 +231,7 @@ def reveal_in_file_manager(path: str | Path) -> tuple[bool, str]:
         explorer_target = os.path.normpath(str(target))
         args = ["explorer.exe"]
         if is_file:
-            # Explorer parses switches as comma-delimited fields; keep /select, separate from the path.
+
             args.extend(["/select,", explorer_target])
         else:
             args.append(explorer_target)
@@ -278,7 +282,7 @@ def reveal_in_file_manager(path: str | Path) -> tuple[bool, str]:
         if shutil.which("dolphin"):
             file_manager_commands.append(["dolphin", "--new-window", "--select", str(target)])
         if shutil.which("thunar"):
-            # Thunar selects file URIs/paths when invoked with a file argument.
+
             file_manager_commands.append(["thunar", str(target)])
 
         for command in file_manager_commands:
@@ -303,6 +307,37 @@ def _effective_duplicate_similarity(base_threshold: float, overlap_frames: int) 
         return max(base_threshold, 0.92)
     return base_threshold
 
+
+def _duration_compare_limit_s(duration_a: float, duration_b: float) -> float:
+    longer = max(float(duration_a), float(duration_b), 0.0)
+    return max(float(Thresholds.DURATION_PADDING_S), longer * float(Thresholds.DURATION_PADDING_RATIO))
+
+
+def _durations_comparable(duration_a: float, duration_b: float) -> bool:
+    return abs(float(duration_a) - float(duration_b)) <= _duration_compare_limit_s(duration_a, duration_b)
+
+
+def _effective_sample_fps(duration_s: float, sample_fps: float, max_frames: int) -> float:
+    duration_s = max(float(duration_s), 1e-6)
+    sample_fps = max(float(sample_fps), 1e-6)
+    max_frames = max(int(max_frames), 1)
+    span_fps = max_frames / duration_s
+    return min(sample_fps, span_fps)
+
+
+def _prefer_as_original(a: "VideoFingerprint", b: "VideoFingerprint") -> tuple["VideoFingerprint", "VideoFingerprint"]:
+    area_a = max(0, int(a.width)) * max(0, int(a.height))
+    area_b = max(0, int(b.width)) * max(0, int(b.height))
+    if area_a != area_b:
+        return (a, b) if area_a >= area_b else (b, a)
+    if int(a.file_size) != int(b.file_size):
+        return (a, b) if int(a.file_size) >= int(b.file_size) else (b, a)
+
+    if _normalized_text(a.path).casefold() <= _normalized_text(b.path).casefold():
+        return a, b
+    return b, a
+
+
 def _is_better_alignment(
     similarity: float,
     overlap_frames: int,
@@ -326,16 +361,17 @@ def _is_better_alignment(
         return False
     return offset_frames < best_offset_frames
 
+
 def _prefilter_hamming_radius(base_similarity: float, frame_count: int, *, min_radius: int = 14) -> int:
     radius = int(round((1.0 - float(base_similarity)) * float(Thresholds.PHASH_BITS)))
     radius = max(0, min(Thresholds.PHASH_BITS, radius))
-    # A whole-video consensus hash is only a loose gate, so keep the radius conservative,
-    # but avoid the overly-wide 20-bit floor that floods the BK-Tree with candidates.
+
     radius = max(radius, int(min_radius))
     if frame_count < 30:
         radius = min(Thresholds.PHASH_BITS, radius + 4)
+    elif frame_count < 90:
+        radius = min(Thresholds.PHASH_BITS, radius + 2)
     return radius
-
 
 
 @dataclass(frozen=True, slots=True)
@@ -531,6 +567,7 @@ class MatchConfig:
     consensus_min_hamming_radius: int = 14
     max_offset_s: int = 600
     min_overlap_frames: int = 10
+    require_comparable_duration: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -550,6 +587,7 @@ class VideoFingerprint:
     file_size: int
     width: int
     height: int
+    sample_fps: float = 1.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -573,6 +611,8 @@ class DedupDatabase:
         "height",
         "phash_data",
         "consensus_hash",
+        "sample_fps",
+        "schema_version",
     }
 
     def __init__(self, db_path: str | Path, *, commit_every: int = 100):
@@ -616,7 +656,9 @@ class DedupDatabase:
                     width INTEGER NOT NULL DEFAULT 0,
                     height INTEGER NOT NULL DEFAULT 0,
                     phash_data BLOB NOT NULL,
-                    consensus_hash TEXT NOT NULL
+                    consensus_hash TEXT NOT NULL,
+                    sample_fps REAL NOT NULL DEFAULT 1.0,
+                    schema_version INTEGER NOT NULL DEFAULT 2
                 );
                 """
             )
@@ -674,11 +716,13 @@ class DedupDatabase:
         file_size: int,
         mtime_ns: int,
         fast_sig: Optional[str],
-    ) -> Optional[tuple[float, np.ndarray, int, int, int]]:
+    ) -> Optional[tuple[float, np.ndarray, int, int, int, float]]:
         try:
             with self._lock:
                 row = self._conn.execute(
-                    "SELECT file_size, mtime_ns, fast_sig, duration, width, height, phash_data, consensus_hash FROM video_cache WHERE cache_key = ?",
+                    "SELECT file_size, mtime_ns, fast_sig, duration, width, height, "
+                    "phash_data, consensus_hash, sample_fps, schema_version "
+                    "FROM video_cache WHERE cache_key = ?",
                     (cache_key,),
                 ).fetchone()
         except sqlite3.Error:
@@ -690,14 +734,30 @@ class DedupDatabase:
         if int(row["file_size"] or -1) != int(file_size):
             return None
 
+        try:
+            schema_version = int(row["schema_version"] or 0)
+        except Exception:
+            schema_version = 0
+        if schema_version != int(Thresholds.CACHE_SCHEMA_VERSION):
+            try:
+                self.delete(cache_key)
+            except Exception:
+                pass
+            return None
+
         row_fast_sig = row["fast_sig"]
         row_mtime_ns = row["mtime_ns"]
+        mtime_tol_ns = int(float(Thresholds.MTIME_TOLERANCE_S) * 1_000_000_000)
 
-        if fast_sig is not None and row_fast_sig:
-            if str(row_fast_sig) != str(fast_sig):
+        if row_fast_sig:
+
+            if fast_sig is None or str(row_fast_sig) != str(fast_sig):
                 return None
         else:
-            if row_mtime_ns is None or int(row_mtime_ns) != int(mtime_ns):
+
+            if row_mtime_ns is None:
+                return None
+            if abs(int(row_mtime_ns) - int(mtime_ns)) > mtime_tol_ns:
                 return None
 
         blob = row["phash_data"]
@@ -733,12 +793,20 @@ class DedupDatabase:
                 pass
             return None
 
+        try:
+            sample_fps = float(row["sample_fps"] or 1.0)
+        except Exception:
+            sample_fps = 1.0
+        if not math.isfinite(sample_fps) or sample_fps <= 0:
+            sample_fps = 1.0
+
         return (
             float(duration),
             hashes.astype(np.uint64, copy=False),
             int(consensus_int),
             int(width or 0),
             int(height or 0),
+            float(sample_fps),
         )
 
     def upsert_fingerprint(
@@ -754,6 +822,7 @@ class DedupDatabase:
         height: int,
         hashes: np.ndarray,
         consensus_hash: int,
+        sample_fps: float = 1.0,
     ) -> None:
         hashes_arr = np.asarray(hashes, dtype=np.uint64)
         blob = sqlite3.Binary(pickle.dumps(hashes_arr, protocol=pickle.HIGHEST_PROTOCOL))
@@ -761,8 +830,11 @@ class DedupDatabase:
         with self._lock:
             self._conn.execute(
                 """
-                INSERT INTO video_cache(cache_key, display_rel_path, file_size, mtime_ns, fast_sig, duration, width, height, phash_data, consensus_hash)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO video_cache(
+                    cache_key, display_rel_path, file_size, mtime_ns, fast_sig, duration,
+                    width, height, phash_data, consensus_hash, sample_fps, schema_version
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(cache_key) DO UPDATE SET
                     display_rel_path=excluded.display_rel_path,
                     file_size=excluded.file_size,
@@ -772,7 +844,9 @@ class DedupDatabase:
                     width=excluded.width,
                     height=excluded.height,
                     phash_data=excluded.phash_data,
-                    consensus_hash=excluded.consensus_hash
+                    consensus_hash=excluded.consensus_hash,
+                    sample_fps=excluded.sample_fps,
+                    schema_version=excluded.schema_version
                 """,
                 (
                     cache_key,
@@ -785,6 +859,8 @@ class DedupDatabase:
                     int(height),
                     blob,
                     consensus_hex,
+                    float(sample_fps),
+                    int(Thresholds.CACHE_SCHEMA_VERSION),
                 ),
             )
             self._pending_writes += 1
@@ -970,6 +1046,7 @@ def best_time_shift_similarity(
     best_offset = 0
     best_overlap = 0
     max_possible_overlap = min(len_a, len_b)
+    exit_threshold = float(early_exit_threshold) if early_exit_threshold > 0 else 0.0
 
     def eval_offset(offset_frames: int) -> tuple[float, int]:
         a_start = max(0, -offset_frames)
@@ -1002,9 +1079,13 @@ def best_time_shift_similarity(
             best_offset = offset_frames
             best_overlap = overlap
 
+
         early_exit = (
-            early_exit_threshold > 0
-            and similarity >= 1.0 - 1e-12
+            exit_threshold > 0
+            and overlap >= max_possible_overlap
+            and similarity >= max(exit_threshold, 0.999)
+        ) or (
+            similarity >= 1.0 - 1e-12
             and overlap >= max_possible_overlap
         )
         return early_exit, similarity, overlap
@@ -1022,9 +1103,13 @@ def best_time_shift_similarity(
             return 0.0, 0, 0
         return best_similarity, best_offset, best_overlap
 
+
     coarse_offsets = list(range(low, high + 1, coarse_step))
     if coarse_offsets[-1] != high:
         coarse_offsets.append(high)
+    if low <= 0 <= high and 0 not in coarse_offsets:
+        coarse_offsets.append(0)
+    coarse_offsets = sorted(set(coarse_offsets))
 
     coarse_results: list[tuple[float, int, int]] = []
     best_coarse_similarity = -1.0
@@ -1045,16 +1130,27 @@ def best_time_shift_similarity(
         reverse=True,
     )
 
-    selected_offsets = {offset for _sim, _ov, offset in coarse_results[:8]}
-    similarity_margin = 0.06 if best_coarse_similarity < 0.8 else 0.03
+
+    selected_offsets = {offset for _sim, _ov, offset in coarse_results[:12]}
+    similarity_margin = 0.08 if best_coarse_similarity < 0.8 else 0.04
     for similarity, overlap, offset_frames in coarse_results:
         if similarity >= (best_coarse_similarity - similarity_margin):
             selected_offsets.add(offset_frames)
 
+    by_offset = {off: (sim, ov) for sim, ov, off in coarse_results}
+    sorted_off = sorted(by_offset)
+    for idx, off in enumerate(sorted_off):
+        sim, _ov = by_offset[off]
+        left = by_offset[sorted_off[idx - 1]][0] if idx > 0 else -1.0
+        right = by_offset[sorted_off[idx + 1]][0] if idx + 1 < len(sorted_off) else -1.0
+        if sim >= left and sim >= right and sim >= 0.55:
+            selected_offsets.add(off)
+
     fine_offsets: set[int] = set()
+    half = coarse_step
     for coarse_offset in selected_offsets:
-        fine_low = max(low, int(coarse_offset) - coarse_step)
-        fine_high = min(high, int(coarse_offset) + coarse_step)
+        fine_low = max(low, int(coarse_offset) - half)
+        fine_high = min(high, int(coarse_offset) + half)
         fine_offsets.update(range(fine_low, fine_high + 1))
 
     if low <= 0 <= high:
@@ -1064,6 +1160,18 @@ def best_time_shift_similarity(
         early_exit, _similarity, _overlap = record_candidate(offset_frames)
         if early_exit:
             break
+
+
+    if best_similarity >= 0 and best_similarity < 0.97 and coarse_step > 1:
+        denser_half = max(coarse_step * 2, 8)
+        denser_low = max(low, best_offset - denser_half)
+        denser_high = min(high, best_offset + denser_half)
+        for offset_frames in range(denser_low, denser_high + 1):
+            if offset_frames in fine_offsets:
+                continue
+            early_exit, _similarity, _overlap = record_candidate(offset_frames)
+            if early_exit:
+                break
 
     if best_similarity < 0:
         return 0.0, 0, 0
@@ -1136,24 +1244,17 @@ def _fingerprint_video_worker(
         on_log(f"[DONE] Finished: {video_name} (cancelled)")
         return _failed("cancelled", cancelled=True)
 
+
+    fast_sig = _fast_file_signature(path_obj, file_size)
     cached = db.get_fingerprint(
         cache_key,
         file_size=file_size,
         mtime_ns=mtime_ns,
-        fast_sig=None,
+        fast_sig=fast_sig,
     )
-    fast_sig: Optional[str] = None
-    if cached is None:
-        fast_sig = _fast_file_signature(path_obj, file_size)
-        cached = db.get_fingerprint(
-            cache_key,
-            file_size=file_size,
-            mtime_ns=mtime_ns,
-            fast_sig=fast_sig,
-        )
 
     if cached is not None:
-        duration_s, hashes_arr, consensus, width, height = cached
+        duration_s, hashes_arr, consensus, width, height, sample_fps = cached
         on_log(f"[HASH] Loaded {int(hashes_arr.size)} frames from cache for: {video_name}")
         on_log(f"[DONE] Finished: {video_name} (cached)")
         return {
@@ -1167,6 +1268,7 @@ def _fingerprint_video_worker(
             "cached": True,
             "width": int(width),
             "height": int(height),
+            "sample_fps": float(sample_fps),
         }
 
     validator = FFprobeValidator(binaries.ffprobe_path, timeout_s=fingerprint_config.ffprobe_timeout_s)
@@ -1184,13 +1286,24 @@ def _fingerprint_video_worker(
         return _failed(f"frame_size must be {Thresholds.FRAME_SIZE}.")
     bytes_per_frame = frame_size * frame_size
 
-    sample_fps = float(fingerprint_config.sample_fps)
     max_frames = int(fingerprint_config.max_frames)
     if max_frames <= 0:
         on_log(f"[DONE] Finished: {video_name} (skipped: max_frames must be > 0)")
         return _failed("max_frames must be > 0.")
 
-    vf = f"fps={sample_fps},scale={frame_size}:{frame_size}:flags=bicubic,format=gray"
+
+    sample_fps = _effective_sample_fps(
+        meta.duration_s,
+        float(fingerprint_config.sample_fps),
+        max_frames,
+    )
+    if sample_fps + 1e-9 < float(fingerprint_config.sample_fps):
+        on_log(
+            f"[HASH] Long video: using sample_fps={sample_fps:.4f} "
+            f"(span full {meta.duration_s:.1f}s within {max_frames} frames) for: {video_name}"
+        )
+
+    vf = f"fps={sample_fps:.6f},scale={frame_size}:{frame_size}:flags=bicubic,format=gray"
     cmd = [
         binaries.ffmpeg_path,
         "-hide_banner",
@@ -1265,7 +1378,13 @@ def _fingerprint_video_worker(
 
         on_log(f"[HASH] Extracted {len(hashes)} frames for: {video_name}")
 
-        wait_timeout_s = max(10, int(fingerprint_config.ffmpeg_timeout_s or 0))
+
+        configured_timeout = int(fingerprint_config.ffmpeg_timeout_s or 0)
+        wait_timeout_s = max(
+            30,
+            configured_timeout if configured_timeout > 0 else 0,
+            min(300, int(meta.duration_s // 20) + 20),
+        )
         try:
             proc.wait(timeout=wait_timeout_s)
         except subprocess.TimeoutExpired:
@@ -1325,6 +1444,7 @@ def _fingerprint_video_worker(
             height=height,
             hashes=hashes_arr,
             consensus_hash=int(consensus),
+            sample_fps=float(sample_fps),
         )
     except Exception as exc:
         on_log(f"[WARN] {_timestamp()} Cache write failed for {video_name}: {exc}")
@@ -1341,6 +1461,7 @@ def _fingerprint_video_worker(
         "cached": False,
         "width": width,
         "height": height,
+        "sample_fps": float(sample_fps),
     }
 
 
@@ -1399,12 +1520,13 @@ class VideoDedupEngine:
 
         moved_back = 0
         removed_folders = 0
-        total_files = sum(1 for folder in folders for path in folder.glob("*") if path.is_file())
+        total_files = sum(1 for folder in folders for path in folder.rglob("*") if path.is_file())
         done = 0
 
         log(f"[INFO] {_timestamp()} Cleaning up {len(folders)} folder(s) matching {prefix}* ...")
         for folder in folders:
-            for file_path in [p for p in folder.iterdir() if p.is_file()]:
+            file_paths = sorted((p for p in folder.rglob("*") if p.is_file()), key=_path_sort_key)
+            for file_path in file_paths:
                 if should_cancel():
                     log(f"[INFO] {_timestamp()} Cleanup cancelled.")
                     return {"moved_back": moved_back, "removed_folders": removed_folders, "cancelled": True}
@@ -1418,7 +1540,14 @@ class VideoDedupEngine:
                 if total_files:
                     progress(int((done / total_files) * 100))
 
+
             try:
+                for sub in sorted(folder.rglob("*"), key=lambda p: len(p.parts), reverse=True):
+                    if sub.is_dir():
+                        try:
+                            sub.rmdir()
+                        except OSError:
+                            pass
                 folder.rmdir()
                 removed_folders += 1
             except OSError:
@@ -1596,24 +1725,28 @@ class VideoDedupEngine:
 
         duration_items.sort(key=lambda item: item[0])
         tolerance = max(0.0, float(self._config.duration_tolerance_s))
-        log(f"[INFO] {_timestamp()} Phase 2: grouping durations with tolerance <= {tolerance:.2f}s.")
+        log(
+            f"[INFO] {_timestamp()} Phase 2: grouping durations with absolute tolerance "
+            f"<= {tolerance:.2f}s from cluster base."
+        )
+
 
         clusters: list[list[tuple[float, Path]]] = []
         current_cluster: list[tuple[float, Path]] = []
-        previous_duration: float | None = None
+        cluster_base: float | None = None
         for item in duration_items:
             duration_s, _path = item
-            if not current_cluster:
+            if not current_cluster or cluster_base is None:
                 current_cluster = [item]
-                previous_duration = duration_s
+                cluster_base = duration_s
                 continue
 
-            if previous_duration is not None and (duration_s - previous_duration) <= tolerance:
+            if (duration_s - cluster_base) <= tolerance:
                 current_cluster.append(item)
             else:
                 clusters.append(current_cluster)
                 current_cluster = [item]
-            previous_duration = duration_s
+                cluster_base = duration_s
 
         if current_cluster:
             clusters.append(current_cluster)
@@ -1743,13 +1876,14 @@ class VideoDedupEngine:
 
             fp_config = self._config.fingerprint
             match_config = self._config.match
-            max_offset_frames = int(round(match_config.max_offset_s * fp_config.sample_fps))
             min_overlap = int(match_config.min_overlap_frames)
             max_threads = max(1, min(16, int(self._config.max_threads)))
+            require_duration = bool(match_config.require_comparable_duration)
 
             fingerprints: list[VideoFingerprint] = []
             cancelling = False
             completed = 0
+            comparisons_skipped_duration = 0
             progress(0)
             on_status({"stage": "Hashing", "total": total_videos, "completed": 0, "current_file": ""})
 
@@ -1832,6 +1966,7 @@ class VideoDedupEngine:
                                 file_size=int(result.get("file_size") or 0),
                                 width=int(result.get("width") or 0),
                                 height=int(result.get("height") or 0),
+                                sample_fps=float(result.get("sample_fps") or fp_config.sample_fps or 1.0),
                             )
                         )
 
@@ -1865,6 +2000,12 @@ class VideoDedupEngine:
                 f"[INFO] {_timestamp()} Phase 3: BK-Tree prefilter <= {base_max_hamming} bit(s) "
                 "(consensus-hash loose gate)"
             )
+            if require_duration:
+                log(
+                    f"[INFO] {_timestamp()} Phase 3: Duration gate "
+                    f"pad>={Thresholds.DURATION_PADDING_S:.0f}s or "
+                    f"{Thresholds.DURATION_PADDING_RATIO:.0%} of longer file."
+                )
             log(f"[INFO] {_timestamp()} Phase 3: Coarse-to-fine offset search across BK-Tree candidates...")
             tree = BKTree(hamming_distance_uint64_scalar)
             duplicates_found = 0
@@ -1897,6 +2038,22 @@ class VideoDedupEngine:
                         break
 
                     other = fingerprints[j]
+                    if require_duration and not _durations_comparable(other.duration_s, fp.duration_s):
+                        comparisons_skipped_duration += 1
+                        continue
+
+
+                    pair_fps = max(
+                        1e-6,
+                        min(float(other.sample_fps or 1.0), float(fp.sample_fps or 1.0)),
+                    )
+                    fps_ratio = max(float(other.sample_fps or 1.0), float(fp.sample_fps or 1.0)) / pair_fps
+                    if fps_ratio > 1.25:
+
+                        comparisons_skipped_duration += 1
+                        continue
+
+                    max_offset_frames = int(round(float(match_config.max_offset_s) * pair_fps))
                     pair_min_overlap = max(1, min(min_overlap, int(other.hashes.size), int(fp.hashes.size)))
 
                     comparisons_run += 1
@@ -1925,20 +2082,28 @@ class VideoDedupEngine:
                             continue
                         reported_pairs.add(pair_key)
 
+                        keep, drop = _prefer_as_original(other, fp)
+
+
+                        if keep.path == other.path:
+                            signed_offset_frames = offset_frames
+                        else:
+                            signed_offset_frames = -offset_frames
+                        offset_s = signed_offset_frames / pair_fps
+
                         duplicates_found += 1
-                        offset_s = offset_frames / fp_config.sample_fps if fp_config.sample_fps else 0.0
                         on_result(
                             {
-                                "original": other.path,
-                                "duplicate": fp.path,
-                                "original_size": int(other.file_size),
-                                "duplicate_size": int(fp.file_size),
-                                "original_duration_s": float(other.duration_s),
-                                "duplicate_duration_s": float(fp.duration_s),
-                                "original_width": int(other.width),
-                                "original_height": int(other.height),
-                                "duplicate_width": int(fp.width),
-                                "duplicate_height": int(fp.height),
+                                "original": keep.path,
+                                "duplicate": drop.path,
+                                "original_size": int(keep.file_size),
+                                "duplicate_size": int(drop.file_size),
+                                "original_duration_s": float(keep.duration_s),
+                                "duplicate_duration_s": float(drop.duration_s),
+                                "original_width": int(keep.width),
+                                "original_height": int(keep.height),
+                                "duplicate_width": int(drop.width),
+                                "duplicate_height": int(drop.height),
                                 "similarity": float(similarity * 100.0),
                                 "offset_s": float(offset_s),
                                 "overlap_frames": int(overlap_frames),
@@ -1973,7 +2138,12 @@ class VideoDedupEngine:
             )
             log(
                 f"[INFO] {_timestamp()} Done. Processed {len(fingerprints)} valid video(s). "
-                f"Compared {comparisons_run} pair(s)."
+                f"Compared {comparisons_run} pair(s)"
+                + (
+                    f", skipped {comparisons_skipped_duration} by duration/fps gate."
+                    if comparisons_skipped_duration
+                    else "."
+                )
             )
             return {"processed": len(fingerprints), "duplicates": duplicates_found, "cancelled": False}
         except Exception as exc:
@@ -2162,7 +2332,7 @@ def run_gui(binaries: FFmpegBinaries) -> int:
             self._root_dir: str | None = None
             self._scan_mode = SCAN_MODE_FULL
 
-            self.setWindowTitle("Video Deduplicator v1.0")
+            self.setWindowTitle("Video Deduplicator v1.1")
             self.setMinimumSize(1280, 780)
             self.setAcceptDrops(True)
 
@@ -2507,7 +2677,14 @@ def run_gui(binaries: FFmpegBinaries) -> int:
                 self.continue_button.setEnabled(False)
                 self.continue_button.setVisible(False)
                 self._start_task("phase3_direct")
+            elif self._scan_mode == SCAN_MODE_DURATION_ONLY:
+
+                self.current_phase = PHASE_TIME
+                self.continue_button.setEnabled(False)
+                self.continue_button.setVisible(False)
+                self._start_task("phase2_time")
             else:
+
                 self.current_phase = PHASE_SIZE
                 self._start_task("phase1_size")
 
@@ -2517,10 +2694,9 @@ def run_gui(binaries: FFmpegBinaries) -> int:
             if not self._root_dir:
                 return
 
-            if self.current_phase == PHASE_SIZE:
-                if self._scan_mode in {SCAN_MODE_FULL, SCAN_MODE_DURATION_ONLY}:
-                    self.current_phase = PHASE_TIME
-                    self._start_task("phase2_time")
+            if self.current_phase == PHASE_SIZE and self._scan_mode == SCAN_MODE_FULL:
+                self.current_phase = PHASE_TIME
+                self._start_task("phase2_time")
             elif self.current_phase == PHASE_TIME and self._scan_mode == SCAN_MODE_FULL:
                 self._start_task("phase3_prepare")
 
@@ -2627,16 +2803,70 @@ def run_gui(binaries: FFmpegBinaries) -> int:
                 message += f" — {current_file}"
             self.stage_label.setText(message)
 
-        def _summary_message(self, processed: int, duplicates: int) -> str:
-            reclaimable = 0
+        def _collect_result_payloads(self) -> list[dict]:
+            payloads: list[dict] = []
             for row in range(self.results_table.rowCount()):
                 payload = self._get_row_payload(row)
-                if not payload:
+                if payload:
+                    payloads.append(payload)
+            return payloads
+
+        def _union_find_masters(self, payloads: list[dict], strategy: str) -> tuple[dict[str, str], dict[str, int]]:
+            parent: dict[str, str] = {}
+            size_map: dict[str, int] = {}
+            area_map: dict[str, int] = {}
+
+            def find(x: str) -> str:
+                while parent[x] != x:
+                    parent[x] = parent[parent[x]]
+                    x = parent[x]
+                return x
+
+            def union(a: str, b: str) -> None:
+                ra, rb = find(a), find(b)
+                if ra != rb:
+                    parent[rb] = ra
+
+            for payload in payloads:
+                original = str(payload.get("original") or "").strip()
+                duplicate = str(payload.get("duplicate") or "").strip()
+                if not original or not duplicate:
                     continue
-                original_size = int(payload.get("original_size") or 0)
-                duplicate_size = int(payload.get("duplicate_size") or 0)
-                if original_size > 0 and duplicate_size > 0:
-                    reclaimable += min(original_size, duplicate_size)
+                for path, size_key, w_key, h_key in (
+                    (original, "original_size", "original_width", "original_height"),
+                    (duplicate, "duplicate_size", "duplicate_width", "duplicate_height"),
+                ):
+                    parent.setdefault(path, path)
+                    size_map[path] = max(size_map.get(path, 0), int(payload.get(size_key) or 0))
+                    area_map[path] = max(
+                        area_map.get(path, 0),
+                        int(payload.get(w_key) or 0) * int(payload.get(h_key) or 0),
+                    )
+                union(original, duplicate)
+
+            components: dict[str, list[str]] = {}
+            for path in parent:
+                components.setdefault(find(path), []).append(path)
+
+            master_of: dict[str, str] = {}
+            for members in components.values():
+                if strategy == "smaller":
+                    master = max(members, key=lambda p: (size_map.get(p, 0), area_map.get(p, 0), p))
+                else:
+                    master = max(members, key=lambda p: (area_map.get(p, 0), size_map.get(p, 0), p))
+                for path in members:
+                    master_of[path] = master
+            return master_of, size_map
+
+        def _summary_message(self, processed: int, duplicates: int) -> str:
+
+            payloads = self._collect_result_payloads()
+            master_of, size_map = self._union_find_masters(payloads, "smaller")
+            reclaimable = sum(
+                size_map.get(path, 0)
+                for path, master in master_of.items()
+                if path != master and size_map.get(path, 0) > 0
+            )
 
             elapsed = None
             if self._scan_started_at is not None:
@@ -3187,65 +3417,23 @@ def run_gui(binaries: FFmpegBinaries) -> int:
             self._update_result_action_states()
             self.statusBar().showMessage(f"Found {self.results_table.rowCount()} duplicate pair(s).", 3000)
 
-        def _select_delete_candidate(self, payload: dict, strategy: str) -> str:
-            original = str(payload.get("original") or "")
-            duplicate = str(payload.get("duplicate") or "")
-            if strategy == "smaller":
-                original_size = int(payload.get("original_size") or 0)
-                duplicate_size = int(payload.get("duplicate_size") or 0)
-                if original_size > 0 and duplicate_size > 0:
-                    if original_size < duplicate_size:
-                        return original
-                    if duplicate_size < original_size:
-                        return duplicate
-                return duplicate or original
-
-            original_area = int(payload.get("original_width") or 0) * int(payload.get("original_height") or 0)
-            duplicate_area = int(payload.get("duplicate_width") or 0) * int(payload.get("duplicate_height") or 0)
-            if original_area > 0 and duplicate_area > 0:
-                if original_area < duplicate_area:
-                    return original
-                if duplicate_area < original_area:
-                    return duplicate
-
-            original_size = int(payload.get("original_size") or 0)
-            duplicate_size = int(payload.get("duplicate_size") or 0)
-            if original_size > 0 and duplicate_size > 0:
-                if original_size < duplicate_size:
-                    return original
-                if duplicate_size < original_size:
-                    return duplicate
-            return duplicate or original
+        def _auto_select_by_strategy(self, strategy: str, label: str) -> None:
+            payloads = self._collect_result_payloads()
+            master_of, _size_map = self._union_find_masters(payloads, strategy)
+            self._selected_delete_paths = {
+                path for path, master in master_of.items() if path != master
+            }
+            self._refresh_table_state()
+            self.statusBar().showMessage(
+                f"Auto-selected {len(self._selected_delete_paths)} file(s) to delete by {label}.",
+                5000,
+            )
 
         def _auto_select_keep_larger(self) -> None:
-            self._selected_delete_paths.clear()
-            for row in range(self.results_table.rowCount()):
-                payload = self._get_row_payload(row)
-                if not payload:
-                    continue
-                candidate = self._select_delete_candidate(payload, "smaller")
-                if candidate:
-                    self._selected_delete_paths.add(candidate)
-            self._refresh_table_state()
-            self.statusBar().showMessage(
-                f"Auto-selected {len(self._selected_delete_paths)} file(s) to delete by size.",
-                5000,
-            )
+            self._auto_select_by_strategy("smaller", "size")
 
         def _auto_select_keep_higher_res(self) -> None:
-            self._selected_delete_paths.clear()
-            for row in range(self.results_table.rowCount()):
-                payload = self._get_row_payload(row)
-                if not payload:
-                    continue
-                candidate = self._select_delete_candidate(payload, "lower_res")
-                if candidate:
-                    self._selected_delete_paths.add(candidate)
-            self._refresh_table_state()
-            self.statusBar().showMessage(
-                f"Auto-selected {len(self._selected_delete_paths)} file(s) to delete by resolution.",
-                5000,
-            )
+            self._auto_select_by_strategy("lower_res", "resolution")
 
         def _export_results_to_csv(self) -> None:
             if self.results_table.rowCount() <= 0:
