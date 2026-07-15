@@ -225,6 +225,7 @@ def run_command(
     try:
         proc = subprocess.Popen(
             args,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -252,7 +253,7 @@ def run_command(
             except OSError:
                 pass
             return -2, "", f"timeout after {timeout}s"
-        return proc.returncode or 0, stdout or "", stderr or ""
+        return int(proc.returncode if proc.returncode is not None else 1), stdout or "", stderr or ""
     finally:
         _unregister_proc(proc)
 
@@ -356,9 +357,10 @@ def stage1_ok(src: StreamInfo, out: StreamInfo) -> Tuple[bool, str]:
     return True, ""
 
 
-def _ffmpeg_err_summary(stderr: str, max_len: int = 1500) -> str:
+def _ffmpeg_err_summary(stderr: str, stdout: str = "", max_len: int = 2000) -> str:
+    combined = "\n".join(x for x in (stderr or "", stdout or "") if x)
     keep: List[str] = []
-    for line in (stderr or "").splitlines():
+    for line in combined.splitlines():
         s = line.strip()
         if not s:
             continue
@@ -371,25 +373,29 @@ def _ffmpeg_err_summary(stderr: str, max_len: int = 1500) -> str:
             continue
         if low.startswith("libav") and "copyright" in low:
             continue
-        if s.startswith("  lib") or s.startswith("lib"):
-            if any(
-                x in low
-                for x in (
-                    "libavutil",
-                    "libavcodec",
-                    "libavformat",
-                    "libavdevice",
-                    "libavfilter",
-                    "libswscale",
-                    "libswresample",
-                    "libpostproc",
-                )
-            ):
-                continue
+        if any(
+            x in low
+            for x in (
+                "libavutil",
+                "libavcodec",
+                "libavformat",
+                "libavdevice",
+                "libavfilter",
+                "libswscale",
+                "libswresample",
+                "libpostproc",
+            )
+        ) and (s.startswith("  ") or low.startswith("lib")):
+            continue
         keep.append(s)
     text = "\n".join(keep).strip()
     if not text:
-        text = (stderr or "").strip()
+        text = combined.strip()
+        if len(text) > max_len:
+            text = "..." + text[-max_len:]
+        if not text:
+            return "(no ffmpeg error text captured)"
+        return text
     if len(text) > max_len:
         return "..." + text[-max_len:]
     return text
@@ -398,19 +404,20 @@ def _ffmpeg_err_summary(stderr: str, max_len: int = 1500) -> str:
 def full_decode_check(path: Path, logger: logging.Logger) -> Tuple[bool, str]:
     args = [
         "ffmpeg",
+        "-nostdin",
         "-hide_banner",
         "-loglevel", "error",
         "-i", str(path),
         "-f", "null",
         "-",
     ]
-    rc, _stdout, stderr = run_command(args, DECODE_CHECK_TIMEOUT_SEC, logger)
+    rc, stdout, stderr = run_command(args, DECODE_CHECK_TIMEOUT_SEC, logger)
     if _shutdown_event.is_set():
         return False, "interrupted during decode check"
     if rc != 0:
-        return False, f"decode check exit {rc}: {_ffmpeg_err_summary(stderr)}"
+        return False, f"decode check exit {rc}: {_ffmpeg_err_summary(stderr, stdout)}"
     if stderr.strip():
-        return False, f"decode errors: {_ffmpeg_err_summary(stderr)}"
+        return False, f"decode errors: {_ffmpeg_err_summary(stderr, stdout)}"
     return True, ""
 
 
@@ -419,37 +426,75 @@ def remux_to_partial(
     partial: Path,
     logger: logging.Logger,
 ) -> Tuple[bool, str]:
-    attempts: List[List[str]] = [
-        [
-            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-            "-i", str(source),
-            "-map", "0:v:0", "-map", "0:a?",
-            "-c", "copy",
-            "-sn", "-dn",
-            "-movflags", "+faststart",
-            str(partial),
-        ],
-        [
-            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-            "-i", str(source),
-            "-map", "0:v:0", "-map", "0:a?",
-            "-c", "copy",
-            "-bsf:a", "aac_adtstoasc",
-            "-sn", "-dn",
-            "-movflags", "+faststart",
-            str(partial),
-        ],
-        [
-            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-            "-i", str(source),
-            "-c", "copy",
-            "-movflags", "+faststart",
-            str(partial),
-        ],
+    attempts: List[Tuple[str, List[str]]] = [
+        (
+            "v0+a copy",
+            [
+                "ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "error",
+                "-i", str(source),
+                "-map", "0:v:0", "-map", "0:a:0?",
+                "-c", "copy",
+                "-sn", "-dn",
+                "-f", "mp4",
+                "-movflags", "+faststart",
+                str(partial),
+            ],
+        ),
+        (
+            "v+a copy",
+            [
+                "ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "error",
+                "-i", str(source),
+                "-map", "0:v", "-map", "0:a?",
+                "-c", "copy",
+                "-sn", "-dn",
+                "-f", "mp4",
+                "-movflags", "+faststart",
+                str(partial),
+            ],
+        ),
+        (
+            "v+a aac_bsf",
+            [
+                "ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "error",
+                "-i", str(source),
+                "-map", "0:v:0", "-map", "0:a:0?",
+                "-c", "copy",
+                "-bsf:a", "aac_adtstoasc",
+                "-sn", "-dn",
+                "-f", "mp4",
+                "-movflags", "+faststart",
+                str(partial),
+            ],
+        ),
+        (
+            "default copy",
+            [
+                "ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "error",
+                "-i", str(source),
+                "-c", "copy",
+                "-f", "mp4",
+                "-movflags", "+faststart",
+                str(partial),
+            ],
+        ),
+        (
+            "video-only copy",
+            [
+                "ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "error",
+                "-i", str(source),
+                "-map", "0:v:0",
+                "-c", "copy",
+                "-an", "-sn", "-dn",
+                "-f", "mp4",
+                "-movflags", "+faststart",
+                str(partial),
+            ],
+        ),
     ]
 
     errors: List[str] = []
-    for args in attempts:
+    for label, args in attempts:
         if _shutdown_event.is_set():
             return False, "interrupted during remux"
 
@@ -459,7 +504,7 @@ def remux_to_partial(
             except OSError:
                 pass
 
-        rc, _stdout, stderr = run_command(args, FFMPEG_TIMEOUT_SEC, logger)
+        rc, stdout, stderr = run_command(args, FFMPEG_TIMEOUT_SEC, logger)
 
         if _shutdown_event.is_set():
             return False, "interrupted during remux"
@@ -470,15 +515,14 @@ def remux_to_partial(
         if rc == 0 and partial.is_file() and partial.stat().st_size > 0:
             return True, ""
 
-        err = _ffmpeg_err_summary(stderr)
+        err = _ffmpeg_err_summary(stderr, stdout)
         lower = err.lower()
         if "no space left" in lower or "enospc" in lower:
             return False, f"disk full during remux (ENOSPC): {err}"
 
-        label = " ".join(args[1:8])
-        errors.append(f"exit {rc} [{label}…]: {err or '(empty stderr)'}")
+        errors.append(f"{label}: exit={rc} {err}")
 
-    return False, "ffmpeg stream-copy failed after retries: " + " || ".join(errors)
+    return False, "ffmpeg stream-copy failed after retries | " + " | ".join(errors)
 
 
 class ConcurrencyGate:
@@ -1059,6 +1103,7 @@ def main() -> int:
 
     logger, log_path = setup_logging(scan_root)
     logger.info("Bulk Video-to-MP4 Remux Converter")
+    logger.info("Script build: 2026-07-15-r3 (nostdin + multi-attempt remux)")
     logger.info("Scan root: %s", scan_root)
     logger.info("Short-video folder: %s", short_dir)
     logger.info("Log file: %s", log_path)
