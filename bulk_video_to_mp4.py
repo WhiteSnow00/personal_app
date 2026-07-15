@@ -356,10 +356,50 @@ def stage1_ok(src: StreamInfo, out: StreamInfo) -> Tuple[bool, str]:
     return True, ""
 
 
+def _ffmpeg_err_summary(stderr: str, max_len: int = 1500) -> str:
+    keep: List[str] = []
+    for line in (stderr or "").splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        low = s.lower()
+        if s.startswith("ffmpeg version"):
+            continue
+        if s.startswith("built with"):
+            continue
+        if s.startswith("configuration:"):
+            continue
+        if low.startswith("libav") and "copyright" in low:
+            continue
+        if s.startswith("  lib") or s.startswith("lib"):
+            if any(
+                x in low
+                for x in (
+                    "libavutil",
+                    "libavcodec",
+                    "libavformat",
+                    "libavdevice",
+                    "libavfilter",
+                    "libswscale",
+                    "libswresample",
+                    "libpostproc",
+                )
+            ):
+                continue
+        keep.append(s)
+    text = "\n".join(keep).strip()
+    if not text:
+        text = (stderr or "").strip()
+    if len(text) > max_len:
+        return "..." + text[-max_len:]
+    return text
+
+
 def full_decode_check(path: Path, logger: logging.Logger) -> Tuple[bool, str]:
     args = [
         "ffmpeg",
-        "-v", "error",
+        "-hide_banner",
+        "-loglevel", "error",
         "-i", str(path),
         "-f", "null",
         "-",
@@ -368,9 +408,9 @@ def full_decode_check(path: Path, logger: logging.Logger) -> Tuple[bool, str]:
     if _shutdown_event.is_set():
         return False, "interrupted during decode check"
     if rc != 0:
-        return False, f"decode check exit {rc}: {(stderr or '').strip()[:500]}"
+        return False, f"decode check exit {rc}: {_ffmpeg_err_summary(stderr)}"
     if stderr.strip():
-        return False, f"decode errors: {stderr.strip()[:500]}"
+        return False, f"decode errors: {_ffmpeg_err_summary(stderr)}"
     return True, ""
 
 
@@ -379,34 +419,66 @@ def remux_to_partial(
     partial: Path,
     logger: logging.Logger,
 ) -> Tuple[bool, str]:
-    args = [
-        "ffmpeg",
-        "-y",
-        "-i", str(source),
-        "-map", "0",
-        "-c", "copy",
-        "-movflags", "+faststart",
-        str(partial),
+    attempts: List[List[str]] = [
+        [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-i", str(source),
+            "-map", "0:v:0", "-map", "0:a?",
+            "-c", "copy",
+            "-sn", "-dn",
+            "-movflags", "+faststart",
+            str(partial),
+        ],
+        [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-i", str(source),
+            "-map", "0:v:0", "-map", "0:a?",
+            "-c", "copy",
+            "-bsf:a", "aac_adtstoasc",
+            "-sn", "-dn",
+            "-movflags", "+faststart",
+            str(partial),
+        ],
+        [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-i", str(source),
+            "-c", "copy",
+            "-movflags", "+faststart",
+            str(partial),
+        ],
     ]
-    rc, _stdout, stderr = run_command(args, FFMPEG_TIMEOUT_SEC, logger)
 
-    if _shutdown_event.is_set():
-        return False, "interrupted during remux"
+    errors: List[str] = []
+    for args in attempts:
+        if _shutdown_event.is_set():
+            return False, "interrupted during remux"
 
-    if rc == -2:
-        return False, "ffmpeg timed out"
+        if partial.exists():
+            try:
+                partial.unlink()
+            except OSError:
+                pass
 
-    if rc != 0:
-        err = (stderr or "").strip()
+        rc, _stdout, stderr = run_command(args, FFMPEG_TIMEOUT_SEC, logger)
+
+        if _shutdown_event.is_set():
+            return False, "interrupted during remux"
+
+        if rc == -2:
+            return False, "ffmpeg timed out"
+
+        if rc == 0 and partial.is_file() and partial.stat().st_size > 0:
+            return True, ""
+
+        err = _ffmpeg_err_summary(stderr)
         lower = err.lower()
         if "no space left" in lower or "enospc" in lower:
-            return False, f"disk full during remux (ENOSPC): {err[:800]}"
-        return False, f"ffmpeg stream-copy failed (exit {rc}): {err[:800]}"
+            return False, f"disk full during remux (ENOSPC): {err}"
 
-    if not partial.is_file() or partial.stat().st_size == 0:
-        return False, "partial output missing or empty after ffmpeg"
+        label = " ".join(args[1:8])
+        errors.append(f"exit {rc} [{label}…]: {err or '(empty stderr)'}")
 
-    return True, ""
+    return False, "ffmpeg stream-copy failed after retries: " + " || ".join(errors)
 
 
 class ConcurrencyGate:
