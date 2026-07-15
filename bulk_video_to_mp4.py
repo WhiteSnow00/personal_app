@@ -33,6 +33,8 @@ PARTIAL_SUFFIX = ".mp4.partial"
 SHORT_VIDEO_DIR_NAME = "short_videos"
 SHORT_VIDEO_THRESHOLD_SEC = 60.0
 
+DUPLICATES_DIR_NAME = "duplicates"
+
 LOG_FILE_PREFIX = "convert_log_"
 
 MAX_CONCURRENT_JOBS = 4
@@ -47,8 +49,15 @@ DURATION_TOLERANCE_REL = 0.01
 FFPROBE_TIMEOUT_SEC = 120
 FFMPEG_TIMEOUT_SEC = 6 * 60 * 60
 DECODE_CHECK_TIMEOUT_SEC = 2 * 60 * 60
+FRAME_EXTRACT_TIMEOUT_SEC = 120
 
 DISPATCH_POLL_INTERVAL_SEC = 0.5
+
+DUP_DURATION_TOLERANCE_SEC = 2.0
+AHASH_WIDTH = 16
+AHASH_HEIGHT = 16
+AHASH_PIXELS = AHASH_WIDTH * AHASH_HEIGHT
+AHASH_HAMMING_THRESHOLD = 15
 
 
 @dataclass
@@ -84,6 +93,19 @@ class RunStats:
     failed: List[Tuple[str, str]] = field(default_factory=list)
     moved_short: int = 0
     interrupted: bool = False
+    duplicates_found: int = 0
+    duplicates_moved: int = 0
+    hash_skipped: List[Tuple[str, str]] = field(default_factory=list)
+
+
+@dataclass
+class MediaMeta:
+    path: Path
+    duration: float
+    width: int
+    height: int
+    size_bytes: int
+    ahash: Optional[int] = None
 
 
 _active_procs: Set[subprocess.Popen] = set()
@@ -193,21 +215,25 @@ def unique_path(dest: Path) -> Path:
         n += 1
 
 
-def unique_short_path(dest_dir: Path, source_mp4: Path, scan_root: Path) -> Path:
-    plain = dest_dir / source_mp4.name
+def unique_moved_path(dest_dir: Path, source_file: Path, scan_root: Path) -> Path:
+    plain = dest_dir / source_file.name
     if not plain.exists():
         return plain
 
     try:
-        rel = source_mp4.resolve().relative_to(scan_root.resolve())
+        rel = source_file.resolve().relative_to(scan_root.resolve())
         prefix = "__".join(rel.parts[:-1]) if rel.parts[:-1] else "root"
         prefix = prefix.replace(os.sep, "__").replace(":", "_").replace("/", "__")
-        prefixed = dest_dir / f"{prefix}__{source_mp4.name}"
+        prefixed = dest_dir / f"{prefix}__{source_file.name}"
         if not prefixed.exists():
             return prefixed
         return unique_path(prefixed)
     except ValueError:
         return unique_path(plain)
+
+
+def unique_short_path(dest_dir: Path, source_mp4: Path, scan_root: Path) -> Path:
+    return unique_moved_path(dest_dir, source_mp4, scan_root)
 
 
 def safety_margin_bytes(total_bytes: int) -> int:
@@ -254,6 +280,57 @@ def run_command(
                 pass
             return -2, "", f"timeout after {timeout}s"
         return int(proc.returncode if proc.returncode is not None else 1), stdout or "", stderr or ""
+    finally:
+        _unregister_proc(proc)
+
+
+def run_command_binary(
+    args: List[str],
+    timeout: float,
+    logger: logging.Logger,
+) -> Tuple[int, bytes, str]:
+    if _shutdown_event.is_set():
+        return -1, b"", "shutdown requested before start"
+
+    try:
+        proc = subprocess.Popen(
+            args,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except FileNotFoundError as exc:
+        return 127, b"", str(exc)
+    except OSError as exc:
+        return 1, b"", str(exc)
+
+    _register_proc(proc)
+    try:
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            logger.warning("Command timed out after %ss: %s", timeout, args[0])
+            try:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=5)
+            except OSError:
+                pass
+            return -2, b"", f"timeout after {timeout}s"
+        err_text = ""
+        if stderr:
+            try:
+                err_text = stderr.decode("utf-8", errors="replace")
+            except Exception:
+                err_text = repr(stderr[:500])
+        return (
+            int(proc.returncode if proc.returncode is not None else 1),
+            stdout or b"",
+            err_text,
+        )
     finally:
         _unregister_proc(proc)
 
@@ -606,20 +683,25 @@ def scan_directory(
     scan_root: Path,
     short_dir: Path,
     logger: logging.Logger,
+    dup_dir: Optional[Path] = None,
 ) -> Tuple[List[Path], List[Path]]:
     to_convert: List[Path] = []
     already_mp4: List[Path] = []
+    skip_dirs: List[Path] = [short_dir]
+    skip_names = {SHORT_VIDEO_DIR_NAME, DUPLICATES_DIR_NAME}
+    if dup_dir is not None:
+        skip_dirs.append(dup_dir)
 
     for dirpath, dirnames, filenames in os.walk(scan_root):
         current = Path(dirpath)
 
         dirnames[:] = [
             d for d in dirnames
-            if (current / d).resolve() != short_dir.resolve()
-            and d != SHORT_VIDEO_DIR_NAME
+            if d not in skip_names
+            and all((current / d).resolve() != sd.resolve() for sd in skip_dirs)
         ]
 
-        if is_under_dir(current, short_dir) and current != scan_root:
+        if any(is_under_dir(current, sd) and current != scan_root for sd in skip_dirs):
             dirnames[:] = []
             continue
 
@@ -1035,6 +1117,381 @@ def _apply_result(result: JobResult, stats: RunStats, logger: logging.Logger) ->
         stats.interrupted = True
 
 
+def _hamming_distance(a: int, b: int) -> int:
+    x = a ^ b
+    try:
+        return x.bit_count()
+    except AttributeError:
+        return bin(x).count("1")
+
+
+def _compute_ahash(pixels: bytes) -> int:
+    n = len(pixels)
+    avg = sum(pixels) / n
+    h = 0
+    for i, p in enumerate(pixels):
+        if p > avg:
+            h |= 1 << i
+    return h
+
+
+def extract_gray_frame(
+    path: Path,
+    timestamp_sec: float,
+    logger: logging.Logger,
+) -> Optional[bytes]:
+    vf = (
+        f"scale={AHASH_WIDTH}:{AHASH_HEIGHT}:force_original_aspect_ratio=decrease,"
+        f"pad={AHASH_WIDTH}:{AHASH_HEIGHT}:(ow-iw)/2:(oh-ih)/2:color=black,"
+        f"format=gray"
+    )
+    ss = max(0.0, float(timestamp_sec))
+    args = [
+        "ffmpeg",
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-ss", f"{ss:.3f}",
+        "-i", str(path),
+        "-vframes", "1",
+        "-vf", vf,
+        "-f", "rawvideo",
+        "pipe:1",
+    ]
+    rc, raw, err = run_command_binary(args, FRAME_EXTRACT_TIMEOUT_SEC, logger)
+    if rc != 0:
+        logger.debug(
+            "Frame extract failed for %s @ %.3fs (exit %s): %s",
+            path,
+            ss,
+            rc,
+            _ffmpeg_err_summary(err),
+        )
+        return None
+    if len(raw) != AHASH_PIXELS:
+        logger.debug(
+            "Frame extract size mismatch for %s @ %.3fs: got %d bytes, want %d",
+            path,
+            ss,
+            len(raw),
+            AHASH_PIXELS,
+        )
+        return None
+    return raw
+
+
+def compute_video_ahash(
+    path: Path,
+    duration: float,
+    logger: logging.Logger,
+) -> Optional[int]:
+    if duration <= 0:
+        return None
+    fractions = (0.50, 0.25, 0.75)
+    for frac in fractions:
+        if _shutdown_event.is_set():
+            return None
+        ts = duration * frac
+        if duration > 1.0:
+            ts = min(ts, max(0.0, duration - 0.05))
+        raw = extract_gray_frame(path, ts, logger)
+        if raw is not None:
+            return _compute_ahash(raw)
+    return None
+
+
+def probe_media_meta(path: Path, logger: logging.Logger) -> Optional[MediaMeta]:
+    args = [
+        "ffprobe",
+        "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=width,height:format=duration",
+        "-of", "default=noprint_wrappers=1",
+        str(path),
+    ]
+    rc, stdout, stderr = run_command(args, FFPROBE_TIMEOUT_SEC, logger)
+    if rc != 0:
+        logger.warning(
+            "DUP skip probe failed: %s — %s",
+            path,
+            (stderr or stdout or f"exit {rc}").strip()[:300],
+        )
+        return None
+
+    duration: Optional[float] = None
+    width = 0
+    height = 0
+    for line in stdout.splitlines():
+        line = line.strip()
+        if line.startswith("duration="):
+            val = line.split("=", 1)[1].strip()
+            if val and val.lower() != "n/a":
+                try:
+                    duration = float(val)
+                except ValueError:
+                    duration = None
+        elif line.startswith("width="):
+            try:
+                width = int(line.split("=", 1)[1].strip())
+            except ValueError:
+                width = 0
+        elif line.startswith("height="):
+            try:
+                height = int(line.split("=", 1)[1].strip())
+            except ValueError:
+                height = 0
+
+    if duration is None or duration < 0:
+        logger.warning("DUP skip no duration: %s", path)
+        return None
+
+    try:
+        size_bytes = path.stat().st_size
+    except OSError as exc:
+        logger.warning("DUP skip stat failed: %s — %s", path, exc)
+        return None
+
+    return MediaMeta(
+        path=path,
+        duration=duration,
+        width=max(0, width),
+        height=max(0, height),
+        size_bytes=size_bytes,
+    )
+
+
+def _quality_key(meta: MediaMeta) -> Tuple[int, int]:
+    return (meta.width * meta.height, meta.size_bytes)
+
+
+def scan_final_mp4s(
+    scan_root: Path,
+    dup_dir: Path,
+    logger: logging.Logger,
+) -> List[Path]:
+    found: List[Path] = []
+    for dirpath, dirnames, filenames in os.walk(scan_root):
+        current = Path(dirpath)
+        dirnames[:] = [
+            d for d in dirnames
+            if d != DUPLICATES_DIR_NAME
+            and (current / d).resolve() != dup_dir.resolve()
+        ]
+        if is_under_dir(current, dup_dir) and current != scan_root:
+            dirnames[:] = []
+            continue
+
+        for name in filenames:
+            path = current / name
+            if is_log_file(path):
+                continue
+            if name.endswith(PARTIAL_SUFFIX) or name.endswith(".partial"):
+                continue
+            if path.suffix.lower() == MP4_EXTENSION:
+                found.append(path)
+
+    found.sort(key=lambda p: str(p).lower())
+    logger.info("Duplicate scan: found %d final .mp4 file(s)", len(found))
+    return found
+
+
+def _duration_groups(metas: List[MediaMeta]) -> List[List[MediaMeta]]:
+    n = len(metas)
+    parent = list(range(n))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i: int, j: int) -> None:
+        ri, rj = find(i), find(j)
+        if ri != rj:
+            parent[rj] = ri
+
+    order = sorted(range(n), key=lambda i: metas[i].duration)
+    for a_idx in range(n):
+        i = order[a_idx]
+        for b_idx in range(a_idx + 1, n):
+            j = order[b_idx]
+            if metas[j].duration - metas[i].duration > DUP_DURATION_TOLERANCE_SEC:
+                break
+            if abs(metas[i].duration - metas[j].duration) <= DUP_DURATION_TOLERANCE_SEC:
+                union(i, j)
+
+    buckets: Dict[int, List[MediaMeta]] = {}
+    for i in range(n):
+        buckets.setdefault(find(i), []).append(metas[i])
+    return [g for g in buckets.values() if len(g) >= 2]
+
+
+def run_duplicate_scan(
+    scan_root: Path,
+    dup_dir: Path,
+    logger: logging.Logger,
+    stats: RunStats,
+) -> None:
+    if _shutdown_event.is_set():
+        return
+
+    logger.info("Starting perceptual duplicate scan (aHash)…")
+    logger.info(
+        "Duplicate rules: duration within ±%.1fs, aHash %dx%d, Hamming < %d",
+        DUP_DURATION_TOLERANCE_SEC,
+        AHASH_WIDTH,
+        AHASH_HEIGHT,
+        AHASH_HAMMING_THRESHOLD,
+    )
+
+    mp4s = scan_final_mp4s(scan_root, dup_dir, logger)
+    if len(mp4s) < 2:
+        logger.info("Duplicate scan: fewer than 2 files — nothing to compare")
+        return
+
+    metas: List[MediaMeta] = []
+    for path in mp4s:
+        if _shutdown_event.is_set():
+            return
+        meta = probe_media_meta(path, logger)
+        if meta is None:
+            stats.hash_skipped.append((str(path), "ffprobe duration/resolution failed"))
+            continue
+        metas.append(meta)
+
+    if len(metas) < 2:
+        logger.info("Duplicate scan: fewer than 2 probeable files")
+        return
+
+    groups = _duration_groups(metas)
+    logger.info(
+        "Duplicate scan: %d duration group(s) with 2+ candidates",
+        len(groups),
+    )
+
+    for group in groups:
+        if _shutdown_event.is_set():
+            return
+
+        hashed: List[MediaMeta] = []
+        for meta in group:
+            if _shutdown_event.is_set():
+                return
+            ah = compute_video_ahash(meta.path, meta.duration, logger)
+            if ah is None:
+                msg = "frame extract/hash failed (50%/25%/75%)"
+                logger.warning("DUP hash skip: %s — %s", _rel(meta.path, scan_root), msg)
+                stats.hash_skipped.append((str(meta.path), msg))
+                continue
+            meta.ahash = ah
+            hashed.append(meta)
+
+        if len(hashed) < 2:
+            continue
+
+        m = len(hashed)
+        parent = list(range(m))
+
+        def find(i: int) -> int:
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+
+        def union(i: int, j: int) -> None:
+            ri, rj = find(i), find(j)
+            if ri != rj:
+                parent[rj] = ri
+
+        for i in range(m):
+            for j in range(i + 1, m):
+                hi = hashed[i].ahash
+                hj = hashed[j].ahash
+                if hi is None or hj is None:
+                    continue
+                dist = _hamming_distance(hi, hj)
+                if dist < AHASH_HAMMING_THRESHOLD:
+                    union(i, j)
+                    stats.duplicates_found += 1
+                    logger.debug(
+                        "aHash near-match: %s ~ %s (Hamming %d)",
+                        hashed[i].path.name,
+                        hashed[j].path.name,
+                        dist,
+                    )
+
+        clusters: Dict[int, List[MediaMeta]] = {}
+        for i in range(m):
+            clusters.setdefault(find(i), []).append(hashed[i])
+
+        for cluster in clusters.values():
+            if len(cluster) < 2:
+                continue
+            if _shutdown_event.is_set():
+                return
+
+            cluster_sorted = sorted(cluster, key=_quality_key, reverse=True)
+            keeper = cluster_sorted[0]
+            losers = cluster_sorted[1:]
+
+            logger.info(
+                "Duplicate cluster: keeping %s (%dx%d, %s)",
+                _rel(keeper.path, scan_root),
+                keeper.width,
+                keeper.height,
+                _human_bytes(keeper.size_bytes),
+            )
+
+            try:
+                dup_dir.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                logger.error("Cannot create duplicates dir %s: %s", dup_dir, exc)
+                return
+
+            for loser in losers:
+                if _shutdown_event.is_set():
+                    return
+                if not loser.path.is_file():
+                    continue
+                if is_under_dir(loser.path, dup_dir):
+                    continue
+
+                keeper_rel = _rel(keeper.path, scan_root)
+                loser_rel = _rel(loser.path, scan_root)
+                dist = (
+                    _hamming_distance(keeper.ahash, loser.ahash)
+                    if keeper.ahash is not None and loser.ahash is not None
+                    else -1
+                )
+                dest = unique_moved_path(dup_dir, loser.path, scan_root)
+                try:
+                    shutil.move(str(loser.path), str(dest))
+                    stats.duplicates_moved += 1
+                    logger.info(
+                        "Duplicate found: %s and %s (Hamming distance: %d). "
+                        "Moving %s to %s/.",
+                        keeper_rel,
+                        loser_rel,
+                        dist,
+                        loser_rel,
+                        DUPLICATES_DIR_NAME,
+                    )
+                except OSError as exc:
+                    logger.warning(
+                        "Could not move duplicate %s -> %s: %s",
+                        loser_rel,
+                        dest,
+                        exc,
+                    )
+
+    logger.info(
+        "Duplicate scan complete: pairs_logged=%d, moved=%d, hash_skipped=%d",
+        stats.duplicates_found,
+        stats.duplicates_moved,
+        len(stats.hash_skipped),
+    )
+
+
 def print_summary(
     stats: RunStats,
     logger: logging.Logger,
@@ -1050,6 +1507,9 @@ def print_summary(
         f"Successfully converted    : {stats.converted}",
         f"Failed                    : {len(stats.failed)}",
         f"Moved to short_videos/    : {stats.moved_short}",
+        f"Duplicates found (pairs)  : {stats.duplicates_found}",
+        f"Moved to duplicates/      : {stats.duplicates_moved}",
+        f"Hash skipped (errors)     : {len(stats.hash_skipped)}",
     ]
     if stats.interrupted:
         lines.append("Run status                : INTERRUPTED (Ctrl+C)")
@@ -1064,6 +1524,13 @@ def print_summary(
             lines.append(f"  - {path}")
             lines.append(f"      reason: {reason}")
 
+    if stats.hash_skipped:
+        lines.append("")
+        lines.append("Hash skipped:")
+        for path, reason in stats.hash_skipped:
+            lines.append(f"  - {path}")
+            lines.append(f"      reason: {reason}")
+
     lines.append("=" * 60)
     text = "\n".join(lines)
     for line in lines:
@@ -1074,14 +1541,24 @@ def print_summary(
     print(text)
 
 
-def cleanup_partials_under(scan_root: Path, short_dir: Path, logger: logging.Logger) -> None:
+def cleanup_partials_under(
+    scan_root: Path,
+    short_dir: Path,
+    logger: logging.Logger,
+    dup_dir: Optional[Path] = None,
+) -> None:
     removed = 0
+    skip_names = {SHORT_VIDEO_DIR_NAME, DUPLICATES_DIR_NAME}
+    skip_dirs = [short_dir]
+    if dup_dir is not None:
+        skip_dirs.append(dup_dir)
+
     for dirpath, dirnames, filenames in os.walk(scan_root):
         current = Path(dirpath)
         dirnames[:] = [
             d for d in dirnames
-            if (current / d).resolve() != short_dir.resolve()
-            and d != SHORT_VIDEO_DIR_NAME
+            if d not in skip_names
+            and all((current / d).resolve() != sd.resolve() for sd in skip_dirs)
         ]
         for name in filenames:
             if name.endswith(PARTIAL_SUFFIX) or name.endswith(".partial"):
@@ -1100,12 +1577,14 @@ def cleanup_partials_under(scan_root: Path, short_dir: Path, logger: logging.Log
 def main() -> int:
     scan_root = Path(os.getcwd()).resolve()
     short_dir = (scan_root / SHORT_VIDEO_DIR_NAME).resolve()
+    dup_dir = (scan_root / DUPLICATES_DIR_NAME).resolve()
 
     logger, log_path = setup_logging(scan_root)
     logger.info("Bulk Video-to-MP4 Remux Converter")
-    logger.info("Script build: 2026-07-15-r3 (nostdin + multi-attempt remux)")
+    logger.info("Script build: 2026-07-15-r4 (perceptual duplicate aHash pass)")
     logger.info("Scan root: %s", scan_root)
     logger.info("Short-video folder: %s", short_dir)
+    logger.info("Duplicates folder: %s", dup_dir)
     logger.info("Log file: %s", log_path)
 
     require_binaries(logger)
@@ -1126,20 +1605,27 @@ def main() -> int:
     previous_handler = signal.signal(signal.SIGINT, _sigint_handler)
 
     try:
-        to_convert, already_mp4 = scan_directory(scan_root, short_dir, logger)
+        to_convert, already_mp4 = scan_directory(
+            scan_root, short_dir, logger, dup_dir=dup_dir
+        )
         stats.scanned_convertible = len(to_convert)
         stats.already_mp4 = len(already_mp4)
 
         if not to_convert and not already_mp4:
-            logger.info("No video files found. Nothing to do.")
-            print_summary(stats, logger, log_path)
-            return 0
+            logger.info("No convertible/non-short-scan videos found; still checking finals…")
 
-        run_conversions(to_convert, scan_root, short_dir, logger, stats)
+        if to_convert:
+            run_conversions(to_convert, scan_root, short_dir, logger, stats)
 
         if not _shutdown_event.is_set():
             remaining_mp4 = [p for p in already_mp4 if p.is_file()]
             run_short_pass(remaining_mp4, scan_root, short_dir, logger, stats)
+
+        if not _shutdown_event.is_set():
+            try:
+                run_duplicate_scan(scan_root, dup_dir, logger, stats)
+            except Exception as exc:
+                logger.exception("Duplicate scan failed (conversion summary still printed): %s", exc)
 
     except KeyboardInterrupt:
         logger.warning("KeyboardInterrupt at top level")
@@ -1148,7 +1634,7 @@ def main() -> int:
         stats.interrupted = True
     finally:
         try:
-            cleanup_partials_under(scan_root, short_dir, logger)
+            cleanup_partials_under(scan_root, short_dir, logger, dup_dir=dup_dir)
         except Exception as exc:
             logger.warning("Partial cleanup error: %s", exc)
         try:
