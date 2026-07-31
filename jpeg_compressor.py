@@ -299,7 +299,6 @@ UI_TEXT: Final[Dict[str, Dict[str, str]]] = {
         "done_size_fail": "Completed with {n} size-limit failure(s). See report for details.",
         "err_output_dir": "Cannot create output directory: {exc}",
         "press_enter": "Press Enter to close…",
-        "interrupted": "Interrupted.",
         "stopped_by_user": "Program stopped by user.",
         "error_prefix": "ERROR: {exc}",
         "strat_a_title": "Maximum Fidelity / Metadata-First",
@@ -460,7 +459,6 @@ UI_TEXT: Final[Dict[str, Dict[str, str]]] = {
         "done_size_fail": "Hoàn tất với {n} size-limit failure(s). Xem report để biết chi tiết.",
         "err_output_dir": "Không tạo được thư mục output: {exc}",
         "press_enter": "Nhấn Enter để đóng…",
-        "interrupted": "Đã ngắt.",
         "stopped_by_user": "Chương trình đã dừng.",
         "error_prefix": "ERROR: {exc}",
         "strat_a_title": "Maximum Fidelity / Metadata-First",
@@ -895,10 +893,6 @@ class ImageProbeResult:
             return "challenging"
         return "difficult"
 
-    @property
-    def compression_potential(self) -> str:
-        return self.compression_potential_for()
-
 
 @dataclass(slots=True)
 class CompressionAttempt:
@@ -1081,31 +1075,6 @@ class BatchReport:
     finished_at: datetime
     total_elapsed_sec: float
     interrupted: bool = False
-
-    @property
-    def success_count(self) -> int:
-        return sum(
-            (
-                1
-                for r in self.results
-                if r.status
-                in (
-                    ImageStatus.COMPRESSED,
-                    ImageStatus.COPIED,
-                    ImageStatus.SANITIZED,
-                    ImageStatus.SKIPPED_UNDER_LIMIT,
-                    ImageStatus.DRY_RUN,
-                )
-                and (
-                    r.output_path is not None
-                    or r.status
-                    in (
-                        ImageStatus.SKIPPED_UNDER_LIMIT,
-                        ImageStatus.DRY_RUN,
-                    )
-                )
-            )
-        )
 
     @property
     def compressed_count(self) -> int:
@@ -2130,18 +2099,6 @@ class BinaryLocator:
         self._ffmpeg_version = self._read_version(self._ffmpeg)
         self._ffprobe_version = self._read_version(self._ffprobe)
         return (self._ffmpeg, self._ffprobe)
-
-    @property
-    def ffmpeg(self) -> Path:
-        if self._ffmpeg is None:
-            raise BinaryNotFoundError("ffmpeg has not been resolved yet")
-        return self._ffmpeg
-
-    @property
-    def ffprobe(self) -> Path:
-        if self._ffprobe is None:
-            raise BinaryNotFoundError("ffprobe has not been resolved yet")
-        return self._ffprobe
 
     @property
     def ffmpeg_version(self) -> str:
@@ -7720,6 +7677,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if not no_pause:
             _pause_if_windows_double_click(interrupted=exit_code == 130)
     return exit_code
+
 
 if __name__ == "__main__":
     sys.exit(main())
