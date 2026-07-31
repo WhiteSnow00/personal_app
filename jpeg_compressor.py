@@ -6082,14 +6082,14 @@ class CLI:
             selected = Prompt.ask(
                 t("resize_prompt"),
                 choices=[key for key, _, _ in options],
-                default="2",
+                default="3",
                 console=self.console,
             )
         else:
             print(f"\n{t('resize_prompt')}:")
             for key, _, label in options:
                 print(f"  {key}) {label}")
-            selected = input("[2]: ").strip() or "2"
+            selected = input("[3]: ").strip() or "3"
         return next(mode for key, mode, _ in options if key == selected)
 
     def confirm_switch_to_all(self) -> bool:
