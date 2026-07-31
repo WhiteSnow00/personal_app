@@ -502,7 +502,6 @@ UI_TEXT: Final[Dict[str, Dict[str, str]]] = {
 ACTIVE_LANG: str = "en"
 ACTIVE_MAX_BYTES: int = DEFAULT_MAX_BYTES
 
-
 def t(key: str, **kwargs: Any) -> str:
     bundle = UI_TEXT.get(ACTIVE_LANG) or UI_TEXT["en"]
     template = bundle.get(key) or UI_TEXT["en"].get(key, key)
@@ -516,11 +515,9 @@ def t(key: str, **kwargs: Any) -> str:
     except (KeyError, ValueError, IndexError):
         return template
 
-
 def set_language(lang: str) -> None:
     global ACTIVE_LANG
     ACTIVE_LANG = lang if lang in UI_TEXT else "en"
-
 
 def status_label(status: "ImageStatus") -> str:
     return t(
@@ -538,7 +535,6 @@ def status_label(status: "ImageStatus") -> str:
         }[status]
     )
 
-
 def friendly_failure_reason(result: "ImageJobResult") -> str:
     if result.status == ImageStatus.SIZE_LIMIT_FAILED:
         base = t("fail_size_limit")
@@ -555,7 +551,6 @@ def friendly_failure_reason(result: "ImageJobResult") -> str:
         return result.message
     return t("fail_none_detail")
 
-
 class CompressorError(Exception):
 
     def __init__(self, message: str, *, cause: Optional[BaseException] = None) -> None:
@@ -568,22 +563,17 @@ class CompressorError(Exception):
             return f"{self.message} (caused by: {self.cause!r})"
         return self.message
 
-
 class BinaryNotFoundError(CompressorError):
     __slots__ = ()
-
 
 class ProbeError(CompressorError):
     __slots__ = ()
 
-
 class ImageSafetyError(ProbeError):
     __slots__ = ()
 
-
 class EncodeError(CompressorError):
     __slots__ = ()
-
 
 class ProcessTerminationError(CompressorError):
 
@@ -597,10 +587,8 @@ class ProcessTerminationError(CompressorError):
         super().__init__(message, cause=cause)
         self.result = result
 
-
 class UserAbortError(CompressorError):
     __slots__ = ()
-
 
 class BatchInterruptedError(UserAbortError):
 
@@ -615,10 +603,8 @@ class BatchInterruptedError(UserAbortError):
             results if isinstance(results, list) else list(results)
         )
 
-
 class WorkspaceError(CompressorError):
     __slots__ = ()
-
 
 class CompressionStrategy(Enum):
     LOSSLESS_FIRST = "A"
@@ -651,7 +637,6 @@ class CompressionStrategy(Enum):
             }[self]
         )
 
-
 class ImageStatus(Enum):
     PENDING = auto()
     SKIPPED_UNDER_LIMIT = auto()
@@ -664,13 +649,11 @@ class ImageStatus(Enum):
     FAILED = auto()
     SIZE_LIMIT_FAILED = auto()
 
-
 class EncodeBackend(Enum):
     NONE = "none"
     COPY = "copy"
     FFMPEG = "ffmpeg"
     PILLOW = "pillow"
-
 
 class OutputFormatChoice(Enum):
     JPG = "1"
@@ -700,7 +683,6 @@ class OutputFormatChoice(Enum):
             }[self]
         )
 
-
 class ImageCodec(Enum):
     JPG = "jpg"
     PNG = "png"
@@ -714,17 +696,14 @@ class ImageCodec(Enum):
     def preserves_alpha(self) -> bool:
         return self in (ImageCodec.PNG, ImageCodec.WEBP)
 
-
 class WebPVariant(Enum):
     LOSSY = "lossy"
     LOSSLESS = "lossless"
-
 
 class ResizeMode(Enum):
     NONE = "none"
     ALL = "all"
     OUTLIERS = "outliers"
-
 
 def detect_source_codec(path: Path) -> ImageCodec:
     suffix = path.suffix.lower()
@@ -736,7 +715,6 @@ def detect_source_codec(path: Path) -> ImageCodec:
         return ImageCodec.WEBP
     return ImageCodec.PNG
 
-
 def resolve_output_codec(path: Path, choice: OutputFormatChoice) -> ImageCodec:
     if choice == OutputFormatChoice.JPG:
         return ImageCodec.JPG
@@ -745,7 +723,6 @@ def resolve_output_codec(path: Path, choice: OutputFormatChoice) -> ImageCodec:
     if choice == OutputFormatChoice.WEBP:
         return ImageCodec.WEBP
     return detect_source_codec(path)
-
 
 def codecs_match_for_copy(path: Path, target: ImageCodec) -> bool:
     suffix = path.suffix.lower()
@@ -760,10 +737,8 @@ def codecs_match_for_copy(path: Path, target: ImageCodec) -> bool:
         native_codec = None
     return native_codec == target
 
-
 def png_palette_quality(colors: int) -> int:
     return clamp(int(round(clamp(colors, 2, 256) / 256 * 94)), 1, 94)
-
 
 def quality_to_webp_params(
     quality: int,
@@ -771,7 +746,6 @@ def quality_to_webp_params(
 ) -> Tuple[int, bool]:
     q = clamp(int(quality), 1, 100)
     return (100, True) if variant == WebPVariant.LOSSLESS else (q, False)
-
 
 @dataclass(frozen=True, slots=True)
 class SizePolicy:
@@ -795,9 +769,7 @@ class SizePolicy:
             return 0.0
         return max(0.0, (1.0 - self.preferred_target_bytes / size_bytes) * 100.0)
 
-
 DEFAULT_SIZE_POLICY: Final[SizePolicy] = SizePolicy()
-
 
 def size_policy_from_website_limit(value: str) -> SizePolicy:
     match = re.fullmatch(
@@ -816,11 +788,9 @@ def size_policy_from_website_limit(value: str) -> SizePolicy:
         preferred_target_bytes=preferred_target_bytes,
     )
 
-
 def set_active_size_policy(policy: SizePolicy) -> None:
     global ACTIVE_MAX_BYTES
     ACTIVE_MAX_BYTES = policy.strict_max_bytes
-
 
 class CancellationToken:
 
@@ -844,7 +814,6 @@ class CancellationToken:
         with self._publication_lock:
             self.raise_if_cancelled()
             return operation()
-
 
 @dataclass(frozen=True, slots=True)
 class ImageDimensions:
@@ -873,7 +842,6 @@ class ImageDimensions:
 
     def __str__(self) -> str:
         return f"{self.width}×{self.height}"
-
 
 @dataclass(slots=True)
 class ImageProbeResult:
@@ -926,7 +894,6 @@ class ImageProbeResult:
             return "challenging"
         return "difficult"
 
-
 @dataclass(slots=True)
 class CompressionAttempt:
     backend: EncodeBackend
@@ -951,7 +918,6 @@ class CompressionAttempt:
     def is_preferred(self, policy: SizePolicy = DEFAULT_SIZE_POLICY) -> bool:
         return self.success and policy.is_preferred(self.output_bytes)
 
-
 @dataclass(frozen=True, slots=True)
 class OutputVerification:
     valid: bool
@@ -971,7 +937,6 @@ class OutputVerification:
             object.__setattr__(self, "structurally_valid", self.valid)
         if self.size_acceptable is None:
             object.__setattr__(self, "size_acceptable", self.valid)
-
 
 @dataclass(slots=True)
 class ImageJobResult:
@@ -1026,7 +991,6 @@ class ImageJobResult:
             return 0.0
         return self.saved_bytes / self.original_bytes * 100.0
 
-
 @dataclass(slots=True)
 class PreflightSummary:
     root: Path
@@ -1045,7 +1009,6 @@ class PreflightSummary:
     scan_elapsed_sec: float
     dimension_stats: Dict[str, Any] = field(default_factory=dict)
     potential_histogram: Dict[str, int] = field(default_factory=dict)
-
 
 @dataclass(slots=True)
 class RuntimeConfig:
@@ -1097,7 +1060,6 @@ class RuntimeConfig:
                 raise ValueError("page canvas dimensions must be positive")
             if self.page_canvas.width % 2 or self.page_canvas.height % 2:
                 raise ValueError("page canvas dimensions must be even")
-
 
 @dataclass(slots=True)
 class BatchReport:
@@ -1285,7 +1247,6 @@ class BatchReport:
             ],
         }
 
-
 def human_bytes(num: Union[int, float], *, binary: bool = False) -> str:
     if num is None:
         return "n/a"
@@ -1306,7 +1267,6 @@ def human_bytes(num: Union[int, float], *, binary: bool = False) -> str:
         n /= unit_step
     return f"{n:.2f} {units[-1]}"
 
-
 def human_duration(seconds: float) -> str:
     if seconds < 0:
         seconds = 0.0
@@ -1318,15 +1278,12 @@ def human_duration(seconds: float) -> str:
         return f"{h}h {m:02d}m {s:02d}s"
     return f"{m}m {s:02d}s"
 
-
 def clamp(value: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, value))
-
 
 def even_dimension(value: Union[int, float]) -> int:
     rounded = max(2, int(round(float(value))))
     return rounded if rounded % 2 == 0 else rounded + 1
-
 
 def parse_page_size(value: str) -> ImageDimensions:
     match = re.fullmatch(r"\s*(\d+)\s*[xX]\s*(\d+)\s*", value)
@@ -1338,13 +1295,11 @@ def parse_page_size(value: str) -> ImageDimensions:
         raise argparse.ArgumentTypeError("page size dimensions must be positive")
     return ImageDimensions(even_dimension(width), even_dimension(height))
 
-
 @dataclass(frozen=True, slots=True)
 class PageCanvasPlan:
     canvas: ImageDimensions
     source: str
     outliers: frozenset[Path]
-
 
 class PageCanvasPlanner:
 
@@ -1446,11 +1401,9 @@ class PageCanvasPlanner:
             )
         return None if reduced == canvas else reduced
 
-
 WINDOWS_RESERVED_BASENAMES: Final[frozenset[str]] = frozenset(
     {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
 )
-
 
 def safe_filename(name: str, *, max_length: int = 180) -> str:
     if max_length < 1:
@@ -1469,7 +1422,6 @@ def safe_filename(name: str, *, max_length: int = 180) -> str:
             cleaned = cleaned[:max_length].rstrip(" .") or "unnamed"
     return cleaned
 
-
 def is_within_directory(path: Path, directory: Path) -> bool:
     try:
         path = path.resolve()
@@ -1477,7 +1429,6 @@ def is_within_directory(path: Path, directory: Path) -> bool:
         return directory == path or directory in path.parents
     except OSError:
         return False
-
 
 def ensure_path_budget(path: Path, *, label: str = "Path") -> None:
     if os.name != "nt":
@@ -1491,11 +1442,9 @@ def ensure_path_budget(path: Path, *, label: str = "Path") -> None:
             f"{label} exceeds the Windows path budget: {resolved}"
         )
 
-
 def atomic_replace(src: Path, dest: Path) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     os.replace(str(src), str(dest))
-
 
 def atomic_publish(src: Path, dest: Path, *, overwrite: bool) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -1523,7 +1472,6 @@ def atomic_publish(src: Path, dest: Path, *, overwrite: bool) -> None:
         return
     atomic_replace(src, dest)
 
-
 def fsync_directory(directory: Path) -> None:
     if os.name == "nt":
         return
@@ -1540,13 +1488,11 @@ def fsync_directory(directory: Path) -> None:
             except OSError:
                 pass
 
-
 def file_size(path: Path) -> int:
     try:
         return path.stat().st_size
     except OSError:
         return -1
-
 
 @dataclass(frozen=True, slots=True)
 class JPEGSanitizeResult:
@@ -1554,7 +1500,6 @@ class JPEGSanitizeResult:
     changed: bool
     preserved_icc: bool
     error: Optional[str] = None
-
 
 class JPEGMetadataSanitizer:
     _STANDALONE = frozenset({0x01, *range(0xD0, 0xD8)})
@@ -1691,7 +1636,6 @@ class JPEGMetadataSanitizer:
             return marker
         raise ValueError("truncated_jpeg_scan")
 
-
 def _container_icc_profile_state(
     path: Path,
 ) -> Tuple[bool, Optional[bytes]]:
@@ -1817,22 +1761,17 @@ def _container_icc_profile_state(
         return False, None
     return False, None
 
-
 def container_icc_profile(path: Path) -> Optional[bytes]:
     return _container_icc_profile_state(path)[1]
-
 
 def icc_profile_sha256(profile: Optional[bytes]) -> Optional[str]:
     return hashlib.sha256(profile).hexdigest() if profile else None
 
-
 def container_icc_profile_sha256(path: Path) -> Optional[str]:
     return icc_profile_sha256(container_icc_profile(path))
 
-
 def container_has_icc_profile(path: Path) -> bool:
     return _container_icc_profile_state(path)[0]
-
 
 def unique_temp_path(directory: Path, suffix: str = ".jpg", *, label: str = "tmp") -> Path:
     if not suffix.startswith("."):
@@ -1844,7 +1783,6 @@ def unique_temp_path(directory: Path, suffix: str = ".jpg", *, label: str = "tmp
     path = directory / name
     ensure_path_budget(path, label="Temporary path")
     return path
-
 
 def quality_to_ffmpeg_q(quality: int) -> int:
     q = clamp(int(quality), 1, 100)
@@ -1876,7 +1814,6 @@ def quality_to_ffmpeg_q(quality: int) -> int:
         return 20
     return clamp(int(round(2 + (100 - q) * 0.28)), FFMPEG_Q_BEST, FFMPEG_Q_WORST)
 
-
 def estimate_output_bytes(
     original_bytes: int,
     quality: int,
@@ -1902,9 +1839,7 @@ def estimate_output_bytes(
     est = int(original_bytes * codec_factor * scale_area * meta_factor)
     return max(1024, est)
 
-
 _PILLOW_CONFIGURED_MAX_PIXELS: Optional[int] = None
-
 
 def configure_pillow_pixel_limit(max_pixels: int) -> None:
     if max_pixels <= 0:
@@ -1918,7 +1853,6 @@ def configure_pillow_pixel_limit(max_pixels: int) -> None:
     elif _PILLOW_CONFIGURED_MAX_PIXELS != max_pixels:
         raise CompressorError("Pillow pixel limit was already configured")
 
-
 def pillow_open(path: Path, max_pixels: int) -> Any:
     if not PILLOW_AVAILABLE or Image is None:
         raise CompressorError("Pillow is not available")
@@ -1928,7 +1862,6 @@ def pillow_open(path: Path, max_pixels: int) -> Any:
         warnings.simplefilter("error", Image.DecompressionBombWarning)
         return Image.open(path)
 
-
 def enforce_image_pixel_limit(
     image: Any,
     max_pixels: int,
@@ -1937,7 +1870,6 @@ def enforce_image_pixel_limit(
     width, height = image.size
     if width <= 0 or height <= 0 or width * height > max_pixels:
         raise ImageSafetyError(message)
-
 
 class CanvasPreparer:
 
@@ -2061,7 +1993,6 @@ class CanvasPreparer:
             has_alpha=probe.has_alpha and target_codec.preserves_alpha,
         )
 
-
 def configure_stdio_utf8() -> None:
     if sys.platform == "win32":
         try:
@@ -2071,13 +2002,11 @@ def configure_stdio_utf8() -> None:
             pass
     os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 
-
 class _PlainFormatter(logging.Formatter):
 
     def format(self, record: logging.LogRecord) -> str:
         record.message = record.getMessage()
         return super().format(record)
-
 
 def setup_logging(
     *,
@@ -2115,7 +2044,6 @@ def setup_logging(
         except OSError as exc:
             logger.warning("Could not open log file %s: %s", log_file, exc)
     return logger
-
 
 class BinaryLocator:
 
@@ -2238,7 +2166,6 @@ class BinaryLocator:
         except (OSError, subprocess.SubprocessError):
             return "unknown"
 
-
 @dataclass(frozen=True, slots=True)
 class FFmpegCapabilities:
     mjpeg: bool
@@ -2254,7 +2181,6 @@ class FFmpegCapabilities:
             "optimal_huffman": self.optimal_huffman,
         }
 
-
 def available_output_codecs(
     capabilities: FFmpegCapabilities,
 ) -> frozenset[ImageCodec]:
@@ -2267,7 +2193,6 @@ def available_output_codecs(
     if capabilities.webp or ImageCodec.WEBP in pillow_codecs:
         codecs.add(ImageCodec.WEBP)
     return frozenset(codecs)
-
 
 def pillow_output_codecs() -> frozenset[ImageCodec]:
     if not PILLOW_AVAILABLE or Image is None:
@@ -2285,7 +2210,6 @@ def pillow_output_codecs() -> frozenset[ImageCodec]:
     ):
         codecs.add(ImageCodec.WEBP)
     return frozenset(codecs)
-
 
 def output_choice_available(
     choice: OutputFormatChoice,
@@ -2308,7 +2232,6 @@ def output_choice_available(
     }
     return required.issubset(codecs)
 
-
 @dataclass(slots=True)
 class CommandResult:
     argv: List[str]
@@ -2322,7 +2245,6 @@ class CommandResult:
     @property
     def ok(self) -> bool:
         return self.returncode == 0 and not self.timed_out and not self.cancelled
-
 
 class SubprocessRunner:
 
@@ -2529,7 +2451,6 @@ class SubprocessRunner:
                     "Could not confirm process termination: pid=%s",
                     proc.pid,
                 )
-
 
 class ImageProber:
 
@@ -2923,7 +2844,6 @@ class ImageProber:
             return ffprobe_pixel_format
         return pillow_pixel_format or ffprobe_pixel_format
 
-
 class OutputVerifier:
 
     def __init__(
@@ -3278,7 +3198,6 @@ class OutputVerifier:
             structurally_valid=True,
         )
 
-
 class FFmpegEncoder:
     name = "ffmpeg"
 
@@ -3569,7 +3488,6 @@ class FFmpegEncoder:
         return "huffman" in text and any(
             marker in text for marker in ("option", "not found", "unrecognized", "invalid")
         )
-
 
 class PillowEncoder:
     name = "pillow"
@@ -3895,7 +3813,6 @@ class PillowEncoder:
         except Exception:
             return None
 
-
 class DualEncoder:
 
     def __init__(
@@ -4112,7 +4029,6 @@ class DualEncoder:
     def release_source(self, source: Path) -> None:
         if self.pillow_encoder is not None:
             self.pillow_encoder.release_source(source)
-
 
 class StrategyEngine:
 
@@ -5468,7 +5384,6 @@ class StrategyEngine:
             scale=best.scale_factor,
         )
 
-
 class PreflightScanner:
 
     def __init__(
@@ -5705,7 +5620,6 @@ class PreflightScanner:
             dimension_stats=dim_stats,
             potential_histogram=dict(pot_hist),
         )
-
 
 class CLI:
 
@@ -6300,7 +6214,6 @@ class CLI:
             )
         return _NullProgress()
 
-
 class _NullProgress:
 
     def __enter__(self) -> "_NullProgress":
@@ -6322,7 +6235,6 @@ class _NullProgress:
         description = kwargs.get("description")
         if description:
             print(f"  .. {description}")
-
 
 class OutputReservation:
 
@@ -6355,7 +6267,6 @@ class OutputReservation:
         except OSError:
             pass
         self.marker = None
-
 
 class OutputPlanner:
 
@@ -6600,7 +6511,6 @@ class OutputPlanner:
         except OSError:
             return True
         return True
-
 
 class BatchProcessor:
 
@@ -7060,7 +6970,6 @@ class ReportWriter:
                     stage.unlink(missing_ok=True)
                 except OSError:
                     pass
-
 
 class Application:
 
@@ -7626,7 +7535,6 @@ class Application:
         )
         return 5
 
-
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="jpeg_compressor")
     parser.add_argument("--input", type=Path, required=True)
@@ -7665,7 +7573,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--baseline-jpeg", action="store_true")
     return parser
 
-
 def parse_headless_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = build_argument_parser()
     namespace = parser.parse_args(list(argv))
@@ -7692,7 +7599,6 @@ def parse_headless_args(argv: Sequence[str]) -> argparse.Namespace:
         parser.error(str(exc))
     return namespace
 
-
 def _pause_if_windows_double_click(*, interrupted: bool = False) -> None:
     if sys.platform != "win32" or interrupted:
         return
@@ -7702,7 +7608,6 @@ def _pause_if_windows_double_click(*, interrupted: bool = False) -> None:
             input(t("press_enter"))
     except EOFError:
         pass
-
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     exit_code = 1
@@ -7739,7 +7644,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if not no_pause:
             _pause_if_windows_double_click(interrupted=exit_code == 130)
     return exit_code
-
 
 if __name__ == "__main__":
     sys.exit(main())
