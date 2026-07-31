@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import argparse
+import hashlib
 import json
 import logging
 import os
@@ -12,15 +14,17 @@ import subprocess
 import sys
 import threading
 import time
-import traceback
 import uuid
-from abc import ABC, abstractmethod
+import warnings
+import zlib
 from collections import Counter
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from contextlib import contextmanager
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum, auto
 from pathlib import Path
+from statistics import median
 from typing import Any, Dict, Final, List, Mapping, Optional, Sequence, Tuple, Union
 
 if sys.version_info < (3, 10):
@@ -60,7 +64,7 @@ except ImportError:
         return text
 
 try:
-    from PIL import Image, ImageOps, __version__ as PILLOW_VERSION
+    from PIL import Image, ImageOps, features as PillowFeatures, __version__ as PILLOW_VERSION
 
     _pillow_version_parts = tuple(
         int(part) for part in re.findall(r"\d+", PILLOW_VERSION)[:3]
@@ -74,19 +78,22 @@ try:
     if not PILLOW_AVAILABLE:
         Image = None
         ImageOps = None
+        PillowFeatures = None
 except ImportError:
     PILLOW_AVAILABLE = False
     PILLOW_VERSION = "not installed"
     PILLOW_IMPORT_ERROR = "Pillow 10.0+ is not installed"
     Image = None
     ImageOps = None
+    PillowFeatures = None
 
-SCRIPT_VERSION: Final[str] = "1.3.0"
+SCRIPT_VERSION: Final[str] = "1.7.0"
 SCRIPT_NAME: Final[str] = "JPEG Batch Compressor"
 TARGET_SIZE_MB: Final[float] = 4.95
 DEFAULT_MAX_BYTES: Final[int] = int(TARGET_SIZE_MB * 1_000_000)
 DEFAULT_OUTPUT_DIRNAME: Final[str] = "compressed_output"
 TEMP_WORKDIR_NAME: Final[str] = ".tmp_compress_work"
+UNCONFIRMED_PROCESS_MARKER: Final[str] = ".process-unconfirmed"
 JPEG_EXTENSIONS: Final[frozenset[str]] = frozenset({".jpg", ".jpeg", ".jpe", ".jfif"})
 CONVERTIBLE_EXTENSIONS: Final[frozenset[str]] = frozenset(
     {".png", ".webp", ".bmp", ".tif", ".tiff"}
@@ -110,9 +117,30 @@ QUALITY_LOSSLESS_PROXY: Final[int] = 100
 QUALITY_BINARY_MIN: Final[int] = 35
 QUALITY_BINARY_MAX: Final[int] = 97
 BINARY_SEARCH_MAX_ITERS: Final[int] = 12
-PNG_PALETTE_QUALITIES: Final[Tuple[int, ...]] = (90, 80, 70, 60, 50, 40, 30)
-DOWNSCALE_FACTORS: Final[Tuple[float, ...]] = (0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6)
-MIN_OUTPUT_DIMENSION: Final[int] = 640
+BINARY_REFINEMENT_RADIUS: Final[int] = 2
+BINARY_FAILURE_OFFSETS: Final[Tuple[int, ...]] = (-1, 1, -2, 2)
+BINARY_FAILURE_ATTEMPT_BUDGET: Final[int] = 4
+PNG_PALETTE_COLOR_TARGETS: Final[Tuple[int, ...]] = (
+    256,
+    192,
+    128,
+    96,
+    64,
+    48,
+    32,
+    16,
+)
+PNG_PALETTE_MIN_COLORS: Final[int] = 2
+PNG_COMPRESS_LEVEL: Final[int] = 9
+MIN_AUTOMATIC_PAGE_SIDE: Final[int] = 640
+UNIFORM_CANVAS_REDUCTION_FACTOR: Final[float] = 0.95
+DEFAULT_MAX_PIXELS: Final[int] = 200_000_000
+FFMPEG_PROCESS_THREADS: Final[int] = 1
+WEBP_SEARCH_METHOD: Final[int] = 4
+WEBP_FINAL_METHOD: Final[int] = 6
+STALE_MARKER_AGE_SEC: Final[float] = 24 * 60 * 60
+SUBPROCESS_COLLECT_TIMEOUT_SEC: Final[float] = 2.0
+WINDOWS_PATH_BUDGET: Final[int] = 240
 DEFAULT_MAX_WORKERS: Final[int] = max(1, min(8, os.cpu_count() or 4))
 LOG_FORMAT: Final[str] = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
 LOG_DATE_FORMAT: Final[str] = "%H:%M:%S"
@@ -185,7 +213,7 @@ UI_TEXT: Final[Dict[str, Dict[str, str]]] = {
         "files_discovered": "Files discovered",
         "jpeg": "JPEG",
         "convertible": "Convertible (PNG/etc.)",
-        "already_under": "Already < {target_mb} MB",
+        "already_under": "Already below limit",
         "need_compression": "Need compression",
         "unreadable_corrupt": "Unreadable / corrupt",
         "total_size": "Total size",
@@ -212,7 +240,7 @@ UI_TEXT: Final[Dict[str, Dict[str, str]]] = {
         "plain_under_over": "Under limit: {u}  Over: {o}",
         "plain_corrupt": "Corrupt: {n}",
         "plain_total": "Total size: {s}",
-        "plain_savings": "Est. savings: ~{lo:.1f}–{hi:.1f} MiB",
+        "plain_savings": "Est. savings: ~{lo:.1f}–{hi:.1f} MB",
         "strat_available": "Available Strategies",
         "col_opt": "Opt",
         "col_name": "Name",
@@ -224,7 +252,20 @@ UI_TEXT: Final[Dict[str, Dict[str, str]]] = {
         "invalid_selection_abc": "Invalid selection. Enter A, B, C, D, or E.",
         "recommended_paren": " (recommended)",
         "confirm_proceed": "Proceed with {title} on {n} oversize file(s)?",
-        "continue_yn": "Continue? [Y/n]: ",
+        "continue_yn": "Continue? [Y/n]:",
+        "resize_prompt": "Choose chapter page resizing",
+        "resize_all": "Resize and pad all pages to the common canvas",
+        "resize_outliers": "Resize only geometry outliers and native failures",
+        "resize_none": "Do not resize or pad pages",
+        "page_size_auto": "Automatic page canvas: {canvas}",
+        "page_size_provided": "Provided page canvas: {canvas}",
+        "uniform_reduce": "Reducing the common page canvas uniformly to {canvas}",
+        "outlier_resize_failed": "Some outlier or retry pages still failed at the common canvas.",
+        "resize_requires_pillow": "Pillow 10.0+ is required for page resizing and padding.",
+        "resize_switch_all": "Switch to resize-all mode with uniform canvas reduction?",
+        "canvas_unavailable": "A stable automatic page canvas could not be derived. Provide --page-size WxH.",
+        "res_resize_mode": "Resize mode",
+        "res_page_canvas": "Page canvas",
         "results_summary": "Results Summary",
         "res_strategy": "Strategy",
         "res_elapsed": "Elapsed",
@@ -240,7 +281,7 @@ UI_TEXT: Final[Dict[str, Dict[str, str]]] = {
         "col_saved": "Saved",
         "col_q": "Q",
         "col_scale": "Scale",
-        "col_notes": "Notes",
+        "col_notes": "Details",
         "fail_section_title": "Failed Files — Action Required",
         "fail_col_reason": "Why it failed",
         "fail_size_limit": "Could not produce an output below the strict size limit with the selected strategy.",
@@ -258,19 +299,18 @@ UI_TEXT: Final[Dict[str, Dict[str, str]]] = {
         "done_size_fail": "Completed with {n} size-limit failure(s). See report for details.",
         "err_output_dir": "Cannot create output directory: {exc}",
         "press_enter": "Press Enter to close…",
-        "aborted": "Aborted.",
         "interrupted": "Interrupted.",
         "stopped_by_user": "Program stopped by user.",
         "error_prefix": "ERROR: {exc}",
-        "strat_a_title": "Near-Lossless / Metadata-First",
+        "strat_a_title": "Maximum Fidelity / Metadata-First",
         "strat_b_title": "High-Quality Lossy (90–95%)",
-        "strat_c_title": "Binary-Search Target (<{target_mb} MB)",
+        "strat_c_title": "Binary-Search Target",
         "strat_d_title": "Aggressive Adaptive (max retention)",
         "strat_e_title": "Copy Already-Compliant Only",
-        "strat_a_desc": "Try the codec's highest-fidelity setting first, then a mild lossy fallback when needed. For PNG, this means optimized lossless followed by a 256-color palette attempt suited to line art and low-color images; photographs may show visible banding. Resolution is preserved.",
-        "strat_b_desc": "Start oversize JPEG/WEBP images at quality 90–95, then search lower qualities if needed. PNG uses optimized lossless plus an ordered palette ladder. Resolution is preserved.",
+        "strat_a_desc": "Try the codec's highest-fidelity setting first, then a mild lossy fallback when needed. PNG uses optimized lossless followed by a deep palette search suited to line art and low-color images.",
+        "strat_b_desc": "Start oversized JPEG/WEBP images at high quality, then search lower qualities when needed. PNG uses optimized lossless plus a deep palette search.",
         "strat_c_desc": "Search JPEG/WEBP quality per image for the highest-quality result below the preferred target. PNG uses codec-aware lossless and palette variants instead of a nominal quality search.",
-        "strat_d_desc": "Full codec-aware pipeline: high-fidelity attempt, quality or palette ladder, then target search where applicable. Resolution is preserved because interactive downscaling is disabled.",
+        "strat_d_desc": "Predictive codec-aware pipeline that skips unnecessary high-fidelity attempts when substantial reduction is required.",
         "strat_e_desc": "Only copy files already under {target_mb} MB into the output folder. Oversize images are skipped (listed in the report). Useful for dry-run style triage.",
         "msg_already_copied": "already under limit — copied or sanitized",
         "msg_already_not_copied": "already under limit (not copied)",
@@ -279,6 +319,16 @@ UI_TEXT: Final[Dict[str, Dict[str, str]]] = {
         "msg_compressed": "compressed to {size} (q={q}, scale={scale:.2f})",
         "msg_size_fail": "could not get under {limit} (best={best})",
         "msg_unable": "unable to reach <{limit}; best effort was {best} at q={q} scale={scale:.2f}",
+        "status_pending": "Pending",
+        "status_skipped_under": "Skipped",
+        "status_skipped_unsupported": "Unsupported",
+        "status_skipped_corrupt": "Unreadable",
+        "status_dry_run": "Dry run",
+        "status_copied": "Copied",
+        "status_sanitized": "Sanitized",
+        "status_compressed": "Compressed",
+        "status_failed": "Failed",
+        "status_size_failed": "Size limit",
     },
     "vi": {
         "lang_prompt": "Select language / Chọn ngôn ngữ",
@@ -324,7 +374,7 @@ UI_TEXT: Final[Dict[str, Dict[str, str]]] = {
         "files_discovered": "File tìm thấy",
         "jpeg": "JPEG",
         "convertible": "Convertible (PNG/etc.)",
-        "already_under": "Đã < {target_mb} MB",
+        "already_under": "Đã dưới giới hạn",
         "need_compression": "Cần nén",
         "unreadable_corrupt": "Không đọc được / corrupt",
         "total_size": "Tổng dung lượng",
@@ -351,7 +401,7 @@ UI_TEXT: Final[Dict[str, Dict[str, str]]] = {
         "plain_under_over": "Dưới limit: {u}  Vượt: {o}",
         "plain_corrupt": "Corrupt: {n}",
         "plain_total": "Tổng size: {s}",
-        "plain_savings": "Ước tiết kiệm: ~{lo:.1f}–{hi:.1f} MiB",
+        "plain_savings": "Ước tiết kiệm: ~{lo:.1f}–{hi:.1f} MB",
         "strat_available": "Các Strategy khả dụng",
         "col_opt": "Opt",
         "col_name": "Tên",
@@ -363,7 +413,20 @@ UI_TEXT: Final[Dict[str, Dict[str, str]]] = {
         "invalid_selection_abc": "Lựa chọn không hợp lệ. Nhập A, B, C, D hoặc E.",
         "recommended_paren": " (khuyến nghị)",
         "confirm_proceed": "Tiếp tục với {title} trên {n} file vượt size?",
-        "continue_yn": "Tiếp tục? [Y/n]: ",
+        "continue_yn": "Tiếp tục? [Y/n]:",
+        "resize_prompt": "Chọn cách đổi kích thước trang",
+        "resize_all": "Đổi và đệm tất cả trang theo khung chung",
+        "resize_outliers": "Chỉ đổi trang lệch chuẩn và trang lỗi ở kích thước gốc",
+        "resize_none": "Không đổi kích thước hoặc đệm trang",
+        "page_size_auto": "Khung trang tự động: {canvas}",
+        "page_size_provided": "Khung trang đã chọn: {canvas}",
+        "uniform_reduce": "Giảm đồng đều khung trang chung xuống {canvas}",
+        "outlier_resize_failed": "Một số trang lệch chuẩn hoặc thử lại vẫn lỗi ở khung chung.",
+        "resize_requires_pillow": "Cần Pillow 10.0+ để đổi kích thước và đệm trang.",
+        "resize_switch_all": "Chuyển sang đổi tất cả trang và giảm khung đồng đều?",
+        "canvas_unavailable": "Không xác định được khung trang tự động ổn định. Hãy dùng --page-size WxH.",
+        "res_resize_mode": "Chế độ đổi kích thước",
+        "res_page_canvas": "Khung trang",
         "results_summary": "Tóm tắt kết quả",
         "res_strategy": "Strategy",
         "res_elapsed": "Thời gian",
@@ -379,7 +442,7 @@ UI_TEXT: Final[Dict[str, Dict[str, str]]] = {
         "col_saved": "Saved",
         "col_q": "Q",
         "col_scale": "Scale",
-        "col_notes": "Ghi chú",
+        "col_notes": "Chi tiết",
         "fail_section_title": "File thất bại — Cần xử lý",
         "fail_col_reason": "Lý do thất bại",
         "fail_size_limit": "Không tạo được output dưới giới hạn dung lượng nghiêm ngặt bằng strategy đã chọn.",
@@ -397,19 +460,18 @@ UI_TEXT: Final[Dict[str, Dict[str, str]]] = {
         "done_size_fail": "Hoàn tất với {n} size-limit failure(s). Xem report để biết chi tiết.",
         "err_output_dir": "Không tạo được thư mục output: {exc}",
         "press_enter": "Nhấn Enter để đóng…",
-        "aborted": "Đã huỷ.",
         "interrupted": "Đã ngắt.",
         "stopped_by_user": "Chương trình đã dừng.",
         "error_prefix": "ERROR: {exc}",
-        "strat_a_title": "Near-Lossless / Metadata-First",
+        "strat_a_title": "Maximum Fidelity / Metadata-First",
         "strat_b_title": "High-Quality Lossy (90–95%)",
-        "strat_c_title": "Binary-Search Target (<{target_mb} MB)",
+        "strat_c_title": "Binary-Search Target",
         "strat_d_title": "Aggressive Adaptive (giữ chất lượng tối đa)",
         "strat_e_title": "Chỉ copy file đã đạt chuẩn",
-        "strat_a_desc": "Thử mức fidelity cao nhất của codec trước, rồi fallback lossy nhẹ khi cần. Với PNG: optimized lossless, sau đó thử palette 256 màu phù hợp line art và ảnh ít màu; ảnh chụp có thể bị banding rõ. Giữ nguyên resolution.",
-        "strat_b_desc": "Bắt đầu JPEG/WEBP vượt size ở quality 90–95, rồi tìm quality thấp hơn nếu cần. PNG dùng optimized lossless và palette ladder có thứ tự. Giữ nguyên resolution.",
+        "strat_a_desc": "Thử mức fidelity cao nhất trước, rồi dùng lossy nhẹ khi cần. PNG dùng lossless tối ưu và tìm palette sâu cho line art hoặc ảnh ít màu.",
+        "strat_b_desc": "Bắt đầu JPEG/WEBP vượt dung lượng ở quality cao, rồi tìm mức thấp hơn khi cần. PNG dùng lossless tối ưu và tìm palette sâu.",
         "strat_c_desc": "Tìm quality JPEG/WEBP cao nhất dưới preferred target. PNG dùng lossless và palette variant đúng theo codec thay vì search quality danh nghĩa.",
-        "strat_d_desc": "Pipeline theo codec: thử fidelity cao, quality hoặc palette ladder, rồi target search khi phù hợp. Giữ nguyên resolution vì giao diện interactive tắt downscale.",
+        "strat_d_desc": "Pipeline dự đoán theo codec, bỏ qua thử nghiệm fidelity cao không cần thiết khi phải giảm nhiều.",
         "strat_e_desc": "Chỉ copy các file đã dưới {target_mb} MB vào output. Image vượt size bị skip (ghi trong report). Hữu ích khi triage kiểu dry-run.",
         "msg_already_copied": "đã dưới limit — đã copy hoặc làm sạch metadata",
         "msg_already_not_copied": "đã dưới limit (không copy)",
@@ -418,6 +480,16 @@ UI_TEXT: Final[Dict[str, Dict[str, str]]] = {
         "msg_compressed": "đã nén còn {size} (q={q}, scale={scale:.2f})",
         "msg_size_fail": "không xuống dưới {limit} (best={best})",
         "msg_unable": "không đạt <{limit}; best effort {best} tại q={q} scale={scale:.2f}",
+        "status_pending": "Đang chờ",
+        "status_skipped_under": "Đã bỏ qua",
+        "status_skipped_unsupported": "Không hỗ trợ",
+        "status_skipped_corrupt": "Không đọc được",
+        "status_dry_run": "Dry run",
+        "status_copied": "Đã sao chép",
+        "status_sanitized": "Đã làm sạch",
+        "status_compressed": "Đã nén",
+        "status_failed": "Thất bại",
+        "status_size_failed": "Vượt dung lượng",
     },
 }
 ACTIVE_LANG: str = "en"
@@ -440,6 +512,23 @@ def t(key: str, **kwargs: Any) -> str:
 def set_language(lang: str) -> None:
     global ACTIVE_LANG
     ACTIVE_LANG = lang if lang in UI_TEXT else "en"
+
+
+def status_label(status: "ImageStatus") -> str:
+    return t(
+        {
+            ImageStatus.PENDING: "status_pending",
+            ImageStatus.SKIPPED_UNDER_LIMIT: "status_skipped_under",
+            ImageStatus.SKIPPED_UNSUPPORTED: "status_skipped_unsupported",
+            ImageStatus.SKIPPED_CORRUPT: "status_skipped_corrupt",
+            ImageStatus.DRY_RUN: "status_dry_run",
+            ImageStatus.COPIED: "status_copied",
+            ImageStatus.SANITIZED: "status_sanitized",
+            ImageStatus.COMPRESSED: "status_compressed",
+            ImageStatus.FAILED: "status_failed",
+            ImageStatus.SIZE_LIMIT_FAILED: "status_size_failed",
+        }[status]
+    )
 
 
 def friendly_failure_reason(result: "ImageJobResult") -> str:
@@ -473,19 +562,36 @@ class CompressorError(Exception):
 
 
 class BinaryNotFoundError(CompressorError):
-    pass
+    __slots__ = ()
 
 
 class ProbeError(CompressorError):
-    pass
+    __slots__ = ()
+
+
+class ImageSafetyError(ProbeError):
+    __slots__ = ()
 
 
 class EncodeError(CompressorError):
-    pass
+    __slots__ = ()
+
+
+class ProcessTerminationError(CompressorError):
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        result: Optional["ImageJobResult"] = None,
+        cause: Optional[BaseException] = None,
+    ) -> None:
+        super().__init__(message, cause=cause)
+        self.result = result
 
 
 class UserAbortError(CompressorError):
-    pass
+    __slots__ = ()
 
 
 class BatchInterruptedError(UserAbortError):
@@ -503,7 +609,7 @@ class BatchInterruptedError(UserAbortError):
 
 
 class WorkspaceError(CompressorError):
-    pass
+    __slots__ = ()
 
 
 class CompressionStrategy(Enum):
@@ -601,6 +707,17 @@ class ImageCodec(Enum):
         return self in (ImageCodec.PNG, ImageCodec.WEBP)
 
 
+class WebPVariant(Enum):
+    LOSSY = "lossy"
+    LOSSLESS = "lossless"
+
+
+class ResizeMode(Enum):
+    NONE = "none"
+    ALL = "all"
+    OUTLIERS = "outliers"
+
+
 def detect_source_codec(path: Path) -> ImageCodec:
     suffix = path.suffix.lower()
     if suffix in JPEG_EXTENSIONS:
@@ -636,34 +753,16 @@ def codecs_match_for_copy(path: Path, target: ImageCodec) -> bool:
     return native_codec == target
 
 
-def quality_to_png_level(quality: int) -> int:
-    return 9
+def png_palette_quality(colors: int) -> int:
+    return clamp(int(round(clamp(colors, 2, 256) / 256 * 94)), 1, 94)
 
 
-def quality_to_png_colors(quality: int) -> Optional[int]:
+def quality_to_webp_params(
+    quality: int,
+    variant: WebPVariant = WebPVariant.LOSSY,
+) -> Tuple[int, bool]:
     q = clamp(int(quality), 1, 100)
-    if q >= 95:
-        return None
-    if q >= 85:
-        return 256
-    if q >= 75:
-        return 192
-    if q >= 65:
-        return 128
-    if q >= 55:
-        return 96
-    if q >= 45:
-        return 64
-    if q >= 35:
-        return 48
-    return 32
-
-
-def quality_to_webp_params(quality: int) -> Tuple[int, bool]:
-    q = clamp(int(quality), 1, 100)
-    if q >= 98:
-        return 100, True
-    return q, False
+    return (100, True) if variant == WebPVariant.LOSSLESS else (q, False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -733,34 +832,13 @@ class ImageDimensions:
             return 0.0
         return self.width / self.height
 
-    def scaled(self, factor: float) -> "ImageDimensions":
-        if factor >= 1.0 or self.width <= 0 or self.height <= 0:
-            return self
-        source_min = min(self.width, self.height)
-        minimum_factor = min(1.0, MIN_OUTPUT_DIMENSION / float(source_min))
-        effective_factor = max(0.0, factor, minimum_factor)
-        if self.width <= self.height:
-            w = self._even_dimension(self.width * effective_factor, self.width)
-            ratio = w / self.width
-            h = self._even_dimension(self.height * ratio, self.height)
-        else:
-            h = self._even_dimension(self.height * effective_factor, self.height)
-            ratio = h / self.height
-            w = self._even_dimension(self.width * ratio, self.width)
-        return ImageDimensions(width=w, height=h)
-
-    @staticmethod
-    def _even_dimension(value: float, maximum: int) -> int:
-        rounded = max(2, int(round(value / 2.0)) * 2)
-        max_even = maximum if maximum % 2 == 0 else maximum - 1
-        if max_even < 2:
-            return max(1, maximum)
-        return min(max_even, rounded)
-
-    def scale_from(self, source: "ImageDimensions") -> float:
-        if source.width <= 0 or source.height <= 0:
-            return 1.0
-        return min(self.width / source.width, self.height / source.height)
+    def reduced(self, factor: float) -> "ImageDimensions":
+        if not 0.0 < factor < 1.0:
+            raise ValueError("factor must be between zero and one")
+        return ImageDimensions(
+            even_dimension(self.width * factor),
+            even_dimension(self.height * factor),
+        )
 
     def __str__(self) -> str:
         return f"{self.width}×{self.height}"
@@ -779,15 +857,17 @@ class ImageProbeResult:
     is_jpeg: bool
     has_metadata_hint: bool
     has_icc_profile: bool = False
+    icc_profile_sha256: Optional[str] = None
     has_alpha: bool = False
     exif_orientation: int = 1
     probe_error: Optional[str] = None
     format_name: Optional[str] = None
     duration: Optional[float] = None
-
-    @property
-    def size_mb(self) -> float:
-        return self.size_bytes / (1024 * 1024)
+    processing_path: Optional[Path] = None
+    processing_dimensions: Optional[ImageDimensions] = None
+    resized: bool = False
+    padded: bool = False
+    canvas_scale: float = 1.0
 
     def is_over_limit(self, policy: SizePolicy = DEFAULT_SIZE_POLICY) -> bool:
         return not policy.is_acceptable(self.size_bytes)
@@ -833,12 +913,37 @@ class CompressionAttempt:
     dimensions: Optional[ImageDimensions] = None
     output_path: Optional[Path] = None
     variant: Optional[str] = None
+    webp_method: Optional[int] = None
+    png_colors: Optional[int] = None
+    transient_failure: bool = False
+    verification: Optional["OutputVerification"] = None
 
     def is_acceptable(self, policy: SizePolicy = DEFAULT_SIZE_POLICY) -> bool:
         return self.success and policy.is_acceptable(self.output_bytes)
 
     def is_preferred(self, policy: SizePolicy = DEFAULT_SIZE_POLICY) -> bool:
         return self.success and policy.is_preferred(self.output_bytes)
+
+
+@dataclass(frozen=True, slots=True)
+class OutputVerification:
+    valid: bool
+    codec: Optional[ImageCodec]
+    dimensions: Optional[ImageDimensions]
+    has_alpha: Optional[bool]
+    has_icc_profile: Optional[bool]
+    size_bytes: int
+    decoder: str
+    error: Optional[str] = None
+    icc_profile_sha256: Optional[str] = None
+    structurally_valid: Optional[bool] = None
+    size_acceptable: Optional[bool] = None
+
+    def __post_init__(self) -> None:
+        if self.structurally_valid is None:
+            object.__setattr__(self, "structurally_valid", self.valid)
+        if self.size_acceptable is None:
+            object.__setattr__(self, "size_acceptable", self.valid)
 
 
 @dataclass(slots=True)
@@ -850,7 +955,10 @@ class ImageJobResult:
     output_bytes: int = 0
     original_dimensions: Optional[ImageDimensions] = None
     output_dimensions: Optional[ImageDimensions] = None
-    strategy_used: Optional[CompressionStrategy] = None
+    target_codec: Optional[ImageCodec] = None
+    source_has_alpha: bool = False
+    source_has_icc_profile: bool = False
+    source_icc_profile_sha256: Optional[str] = None
     backend: EncodeBackend = EncodeBackend.NONE
     quality_used: Optional[int] = None
     ffmpeg_q_used: Optional[int] = None
@@ -860,7 +968,24 @@ class ImageJobResult:
     elapsed_sec: float = 0.0
     error_detail: Optional[str] = None
     variant: Optional[str] = None
+    webp_method: Optional[int] = None
+    png_colors: Optional[int] = None
+    verification: Optional[OutputVerification] = None
+    resized: bool = False
+    padded: bool = False
     work_dir: Optional[Path] = None
+    attempt_cache: Dict[Tuple[Any, ...], CompressionAttempt] = field(
+        default_factory=dict,
+        repr=False,
+    )
+    transient_retries: Dict[Tuple[Any, ...], int] = field(
+        default_factory=dict,
+        repr=False,
+    )
+    attempted_keys: set[Tuple[Any, ...]] = field(
+        default_factory=set,
+        repr=False,
+    )
 
     @property
     def saved_bytes(self) -> int:
@@ -894,14 +1019,6 @@ class PreflightSummary:
     dimension_stats: Dict[str, Any] = field(default_factory=dict)
     potential_histogram: Dict[str, int] = field(default_factory=dict)
 
-    @property
-    def processable(self) -> List[ImageProbeResult]:
-        return [i for i in self.images if i.is_readable]
-
-    @property
-    def total_mb(self) -> float:
-        return self.total_bytes / (1024 * 1024)
-
 
 @dataclass(slots=True)
 class RuntimeConfig:
@@ -910,7 +1027,17 @@ class RuntimeConfig:
     size_policy: SizePolicy = field(default_factory=SizePolicy)
     strategy: CompressionStrategy = CompressionStrategy.AGGRESSIVE_ADAPTIVE
     max_workers: int = DEFAULT_MAX_WORKERS
-    allow_downscale: bool = False
+    max_pixels: int = DEFAULT_MAX_PIXELS
+    resize_mode: ResizeMode = ResizeMode.NONE
+    page_canvas_source: Optional[str] = None
+    page_canvas: Optional[ImageDimensions] = None
+    initial_page_canvas: Optional[ImageDimensions] = None
+    minimum_page_side: int = MIN_AUTOMATIC_PAGE_SIDE
+    uniform_reduction_applied: bool = False
+    allow_upscale: bool = False
+    canvas_paths: frozenset[Path] = field(default_factory=frozenset)
+    reprocess_existing: bool = False
+    recursive: bool = False
     copy_under_limit: bool = True
     overwrite_output: bool = False
     keep_temp_on_failure: bool = False
@@ -920,6 +1047,7 @@ class RuntimeConfig:
     strip_metadata: bool = True
     preserve_icc_profile: bool = True
     output_format: OutputFormatChoice = OutputFormatChoice.JPG
+    runtime_metadata: Dict[str, Any] = field(default_factory=dict)
     cancellation: CancellationToken = field(default_factory=CancellationToken)
 
     @property
@@ -929,6 +1057,19 @@ class RuntimeConfig:
     @property
     def effective_target_bytes(self) -> int:
         return self.size_policy.preferred_target_bytes
+
+    def __post_init__(self) -> None:
+        if self.max_pixels <= 0:
+            raise ValueError("max_pixels must be positive")
+        if self.minimum_page_side <= 0:
+            raise ValueError("minimum page side must be positive")
+        if self.resize_mode != ResizeMode.NONE and self.page_canvas is None:
+            raise ValueError("resize mode requires a page canvas")
+        if self.page_canvas is not None:
+            if self.page_canvas.width <= 0 or self.page_canvas.height <= 0:
+                raise ValueError("page canvas dimensions must be positive")
+            if self.page_canvas.width % 2 or self.page_canvas.height % 2:
+                raise ValueError("page canvas dimensions must be even")
 
 
 @dataclass(slots=True)
@@ -1014,19 +1155,67 @@ class BatchReport:
             "root_dir": str(self.config.root_dir),
             "output_dir": str(self.config.output_dir),
             "language": ACTIVE_LANG,
+            "runtime": {
+                "python": sys.version.split()[0],
+                "platform": platform.platform(),
+                "pillow": PILLOW_VERSION,
+                "rich": RICH_AVAILABLE,
+                "max_pixels": self.config.max_pixels,
+                "recursive": self.config.recursive,
+                "resize_mode": self.config.resize_mode.value,
+                "page_canvas_source": self.config.page_canvas_source,
+                "initial_page_canvas": (
+                    {
+                        "width": self.config.initial_page_canvas.width,
+                        "height": self.config.initial_page_canvas.height,
+                    }
+                    if self.config.initial_page_canvas
+                    else None
+                ),
+                "final_page_canvas": (
+                    {
+                        "width": self.config.page_canvas.width,
+                        "height": self.config.page_canvas.height,
+                    }
+                    if self.config.page_canvas
+                    else None
+                ),
+                "uniform_reduction_applied": self.config.uniform_reduction_applied,
+                "allow_upscale": self.config.allow_upscale,
+                "ffmpeg_process_threads": FFMPEG_PROCESS_THREADS,
+                "progressive_jpeg": self.config.progressive_jpeg,
+                "strip_metadata": self.config.strip_metadata,
+                "preserve_icc_profile": self.config.preserve_icc_profile,
+                **self.config.runtime_metadata,
+            },
+            "preflight": {
+                "total_files_scanned": self.preflight.total_files_scanned,
+                "jpeg_count": self.preflight.jpeg_count,
+                "convertible_count": self.preflight.convertible_count,
+                "under_limit_count": self.preflight.under_limit_count,
+                "over_limit_count": self.preflight.over_limit_count,
+                "corrupt_count": self.preflight.corrupt_count,
+                "total_bytes": self.preflight.total_bytes,
+                "over_limit_bytes": self.preflight.over_limit_bytes,
+                "scan_elapsed_sec": round(self.preflight.scan_elapsed_sec, 3),
+                "dimension_stats": self.preflight.dimension_stats,
+                "potential_histogram": self.preflight.potential_histogram,
+            },
             "summary": {
                 "total_jobs": len(self.results),
                 "compressed": self.compressed_count,
                 "copied": self.copied_count,
                 "failed": self.failed_count,
                 "total_saved_bytes": self.total_saved_bytes,
-                "total_saved_mb": round(self.total_saved_bytes / (1024 * 1024), 3),
+                "total_saved_mb": round(self.total_saved_bytes / 1_000_000, 3),
             },
             "results": [
                 {
                     "source": str(r.source),
                     "work_dir": str(r.work_dir) if r.work_dir else None,
+                    "source_icc_profile_sha256": r.source_icc_profile_sha256,
                     "status": r.status.name,
+                    "status_label": status_label(r.status),
                     "output": str(r.output_path) if r.output_path else None,
                     "original_bytes": r.original_bytes,
                     "output_bytes": r.output_bytes,
@@ -1037,9 +1226,57 @@ class BatchReport:
                     "scale_factor": r.scale_factor,
                     "backend": r.backend.value,
                     "variant": r.variant,
+                    "webp_method": r.webp_method,
+                    "png_colors": r.png_colors,
                     "message": r.message,
                     "elapsed_sec": round(r.elapsed_sec, 3),
                     "error": r.error_detail,
+                    "resized": r.resized,
+                    "padded": r.padded,
+                    "original_dimensions": (
+                        {
+                            "width": r.original_dimensions.width,
+                            "height": r.original_dimensions.height,
+                        }
+                        if r.original_dimensions
+                        else None
+                    ),
+                    "output_dimensions": (
+                        {
+                            "width": r.output_dimensions.width,
+                            "height": r.output_dimensions.height,
+                        }
+                        if r.output_dimensions
+                        else None
+                    ),
+                    "verification": (
+                        {
+                            "valid": r.verification.valid,
+                            "codec": (
+                                r.verification.codec.value
+                                if r.verification.codec
+                                else None
+                            ),
+                            "dimensions": (
+                                {
+                                    "width": r.verification.dimensions.width,
+                                    "height": r.verification.dimensions.height,
+                                }
+                                if r.verification.dimensions
+                                else None
+                            ),
+                            "has_alpha": r.verification.has_alpha,
+                            "has_icc_profile": r.verification.has_icc_profile,
+                            "icc_profile_sha256": r.verification.icc_profile_sha256,
+                            "structurally_valid": r.verification.structurally_valid,
+                            "size_acceptable": r.verification.size_acceptable,
+                            "size_bytes": r.verification.size_bytes,
+                            "decoder": r.verification.decoder,
+                            "error": r.verification.error,
+                        }
+                        if r.verification
+                        else None
+                    ),
                     "attempts": len(r.attempts),
                 }
                 for r in self.results
@@ -1047,14 +1284,18 @@ class BatchReport:
         }
 
 
-def human_bytes(num: Union[int, float], *, binary: bool = True) -> str:
+def human_bytes(num: Union[int, float], *, binary: bool = False) -> str:
     if num is None:
         return "n/a"
     n = float(num)
     if n < 0:
         return f"-{human_bytes(-n, binary=binary)}"
     unit_step = 1024.0 if binary else 1000.0
-    units = ("B", "KiB", "MiB", "GiB", "TiB") if binary else ("B", "KB", "MB", "GB", "TB")
+    units = (
+        ("B", "KiB", "MiB", "GiB", "TiB")
+        if binary
+        else ("B", "KB", "MB", "GB", "TB")
+    )
     for unit in units:
         if abs(n) < unit_step or unit == units[-1]:
             if unit == "B":
@@ -1078,6 +1319,130 @@ def human_duration(seconds: float) -> str:
 
 def clamp(value: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, value))
+
+
+def even_dimension(value: Union[int, float]) -> int:
+    rounded = max(2, int(round(float(value))))
+    return rounded if rounded % 2 == 0 else rounded + 1
+
+
+def parse_page_size(value: str) -> ImageDimensions:
+    match = re.fullmatch(r"\s*(\d+)\s*[xX]\s*(\d+)\s*", value)
+    if match is None:
+        raise argparse.ArgumentTypeError("page size must use WxH, for example 1600x2400")
+    width = int(match.group(1))
+    height = int(match.group(2))
+    if width <= 0 or height <= 0:
+        raise argparse.ArgumentTypeError("page size dimensions must be positive")
+    return ImageDimensions(even_dimension(width), even_dimension(height))
+
+
+@dataclass(frozen=True, slots=True)
+class PageCanvasPlan:
+    canvas: ImageDimensions
+    source: str
+    outliers: frozenset[Path]
+
+
+class PageCanvasPlanner:
+
+    @staticmethod
+    def create(
+        images: Sequence[ImageProbeResult],
+        supplied: Optional[ImageDimensions] = None,
+    ) -> PageCanvasPlan:
+        readable = [
+            image
+            for image in images
+            if image.is_readable and image.dimensions is not None
+        ]
+        if not readable:
+            raise CompressorError("no readable image dimensions are available for page sizing")
+        if supplied is not None:
+            canvas = ImageDimensions(
+                even_dimension(supplied.width),
+                even_dimension(supplied.height),
+            )
+            return PageCanvasPlan(
+                canvas,
+                "user-provided",
+                PageCanvasPlanner._find_outliers(readable, canvas, exact=True),
+            )
+        counts = Counter(image.dimensions for image in readable)
+        modal_dimensions, modal_count = counts.most_common(1)[0]
+        use_modal = modal_count * 2 >= len(readable)
+        if use_modal:
+            canvas = ImageDimensions(
+                even_dimension(modal_dimensions.width),
+                even_dimension(modal_dimensions.height),
+            )
+        else:
+            canvas = ImageDimensions(
+                even_dimension(median(image.dimensions.width for image in readable)),
+                even_dimension(median(image.dimensions.height for image in readable)),
+            )
+        if min(canvas.width, canvas.height) < MIN_AUTOMATIC_PAGE_SIDE:
+            raise CompressorError(
+                f"automatic page canvas {canvas} has a side below {MIN_AUTOMATIC_PAGE_SIDE} pixels"
+            )
+        return PageCanvasPlan(
+            canvas,
+            "automatic",
+            PageCanvasPlanner._find_outliers(readable, canvas, exact=use_modal),
+        )
+
+    @staticmethod
+    def _find_outliers(
+        images: Sequence[ImageProbeResult],
+        canvas: ImageDimensions,
+        *,
+        exact: bool,
+    ) -> frozenset[Path]:
+        outliers: set[Path] = set()
+        canvas_ratio = canvas.aspect_ratio
+        for image in images:
+            dimensions = image.dimensions
+            if dimensions is None:
+                continue
+            if exact:
+                is_outlier = dimensions != canvas
+            else:
+                width_delta = abs(dimensions.width - canvas.width) / canvas.width
+                height_delta = abs(dimensions.height - canvas.height) / canvas.height
+                ratio_delta = abs(dimensions.aspect_ratio - canvas_ratio) / canvas_ratio
+                orientation_differs = (dimensions.width > dimensions.height) != (
+                    canvas.width > canvas.height
+                )
+                is_outlier = (
+                    orientation_differs
+                    or width_delta > 0.08
+                    or height_delta > 0.08
+                    or ratio_delta > 0.04
+                )
+            if is_outlier:
+                outliers.add(image.path)
+        return frozenset(outliers)
+
+    @staticmethod
+    def reduce_uniformly(
+        canvas: ImageDimensions,
+        minimum_side: int,
+    ) -> Optional[ImageDimensions]:
+        shortest = min(canvas.width, canvas.height)
+        if shortest <= minimum_side:
+            return None
+        factor = max(
+            UNIFORM_CANVAS_REDUCTION_FACTOR,
+            minimum_side / float(shortest),
+        )
+        reduced = canvas.reduced(factor)
+        if min(reduced.width, reduced.height) < minimum_side:
+            scale = minimum_side / float(min(reduced.width, reduced.height))
+            reduced = ImageDimensions(
+                even_dimension(reduced.width * scale),
+                even_dimension(reduced.height * scale),
+            )
+        return None if reduced == canvas else reduced
 
 
 WINDOWS_RESERVED_BASENAMES: Final[frozenset[str]] = frozenset(
@@ -1112,6 +1477,19 @@ def is_within_directory(path: Path, directory: Path) -> bool:
         return False
 
 
+def ensure_path_budget(path: Path, *, label: str = "Path") -> None:
+    if os.name != "nt":
+        return
+    try:
+        resolved = path.resolve()
+    except OSError:
+        resolved = path.absolute()
+    if len(str(resolved)) > WINDOWS_PATH_BUDGET:
+        raise WorkspaceError(
+            f"{label} exceeds the Windows path budget: {resolved}"
+        )
+
+
 def atomic_replace(src: Path, dest: Path) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     os.replace(str(src), str(dest))
@@ -1121,18 +1499,24 @@ def atomic_publish(src: Path, dest: Path, *, overwrite: bool) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     if not overwrite:
         fd: Optional[int] = None
+        claimed = False
         try:
             fd = os.open(dest, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        finally:
-            if fd is not None:
-                os.close(fd)
-        try:
+            claimed = True
+            os.close(fd)
+            fd = None
             os.replace(str(src), str(dest))
-        except Exception:
-            try:
-                dest.unlink(missing_ok=True)
-            except OSError:
-                pass
+        except BaseException:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            if claimed:
+                try:
+                    dest.unlink(missing_ok=True)
+                except OSError:
+                    pass
             raise
         return
     atomic_replace(src, dest)
@@ -1149,7 +1533,10 @@ def fsync_directory(directory: Path) -> None:
         pass
     finally:
         if fd is not None:
-            os.close(fd)
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
 
 def file_size(path: Path) -> int:
@@ -1159,10 +1546,302 @@ def file_size(path: Path) -> int:
         return -1
 
 
+@dataclass(frozen=True, slots=True)
+class JPEGSanitizeResult:
+    success: bool
+    changed: bool
+    preserved_icc: bool
+    error: Optional[str] = None
+
+
+class JPEGMetadataSanitizer:
+    _STANDALONE = frozenset({0x01, *range(0xD0, 0xD8)})
+    _PRESERVED_APP = frozenset({0xE0, 0xEE})
+    _ICC_SIGNATURE = b"ICC_PROFILE\x00"
+
+    @classmethod
+    def sanitize(
+        cls,
+        source: Path,
+        destination: Path,
+        *,
+        orientation: int = 1,
+        preserve_icc: bool = True,
+    ) -> JPEGSanitizeResult:
+        if orientation not in (0, 1):
+            return JPEGSanitizeResult(
+                success=False,
+                changed=False,
+                preserved_icc=False,
+                error="non_default_orientation",
+            )
+        try:
+            data = source.read_bytes()
+            output, changed, preserved_icc = cls.sanitize_bytes(
+                data,
+                preserve_icc=preserve_icc,
+            )
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(output)
+            return JPEGSanitizeResult(
+                success=True,
+                changed=changed,
+                preserved_icc=preserved_icc,
+            )
+        except (OSError, ValueError) as exc:
+            try:
+                destination.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return JPEGSanitizeResult(
+                success=False,
+                changed=False,
+                preserved_icc=False,
+                error=str(exc),
+            )
+
+    @classmethod
+    def sanitize_bytes(
+        cls,
+        data: bytes,
+        *,
+        preserve_icc: bool = True,
+    ) -> Tuple[bytes, bool, bool]:
+        if len(data) < 4 or data[:2] != b"\xff\xd8":
+            raise ValueError("invalid_jpeg_soi")
+        output = bytearray(data[:2])
+        offset = 2
+        changed = False
+        preserved_icc = False
+        saw_scan = False
+        while offset < len(data):
+            marker_start = offset
+            marker, offset = cls._read_marker(data, offset)
+            if marker == 0xD9:
+                if not saw_scan:
+                    raise ValueError("jpeg_missing_scan")
+                output.extend(data[marker_start:offset])
+                if offset != len(data):
+                    raise ValueError("jpeg_trailing_data")
+                return bytes(output), changed, preserved_icc
+            if marker in cls._STANDALONE:
+                output.extend(data[marker_start:offset])
+                continue
+            segment_end, payload = cls._read_segment(data, offset)
+            if marker == 0xDA:
+                saw_scan = True
+                output.extend(data[marker_start:segment_end])
+                scan_end = cls._scan_end(data, segment_end)
+                output.extend(data[segment_end:scan_end])
+                offset = scan_end
+                continue
+            keep = marker < 0xE0 or marker in cls._PRESERVED_APP
+            if marker == 0xE2 and payload.startswith(cls._ICC_SIGNATURE):
+                keep = preserve_icc
+                preserved_icc = preserve_icc
+            if keep:
+                output.extend(data[marker_start:segment_end])
+            else:
+                changed = True
+            offset = segment_end
+        raise ValueError("jpeg_missing_eoi")
+
+    @staticmethod
+    def _read_marker(data: bytes, offset: int) -> Tuple[int, int]:
+        if offset >= len(data) or data[offset] != 0xFF:
+            raise ValueError("invalid_jpeg_marker")
+        while offset < len(data) and data[offset] == 0xFF:
+            offset += 1
+        if offset >= len(data):
+            raise ValueError("truncated_jpeg_marker")
+        marker = data[offset]
+        if marker == 0x00:
+            raise ValueError("unexpected_jpeg_stuffing")
+        return marker, offset + 1
+
+    @staticmethod
+    def _read_segment(data: bytes, offset: int) -> Tuple[int, bytes]:
+        if offset + 2 > len(data):
+            raise ValueError("truncated_jpeg_segment")
+        segment_length = int.from_bytes(data[offset : offset + 2], "big")
+        segment_end = offset + segment_length
+        if segment_length < 2 or segment_end > len(data):
+            raise ValueError("invalid_jpeg_segment_length")
+        return segment_end, data[offset + 2 : segment_end]
+
+    @staticmethod
+    def _scan_end(data: bytes, offset: int) -> int:
+        while offset < len(data):
+            marker = data.find(b"\xff", offset)
+            if marker < 0:
+                raise ValueError("truncated_jpeg_scan")
+            if marker + 1 >= len(data):
+                raise ValueError("truncated_jpeg_scan")
+            code_offset = marker + 1
+            while code_offset < len(data) and data[code_offset] == 0xFF:
+                code_offset += 1
+            if code_offset >= len(data):
+                raise ValueError("truncated_jpeg_scan")
+            code = data[code_offset]
+            if code == 0x00 or 0xD0 <= code <= 0xD7:
+                offset = code_offset + 1
+                continue
+            return marker
+        raise ValueError("truncated_jpeg_scan")
+
+
+def _container_icc_profile_state(
+    path: Path,
+) -> Tuple[bool, Optional[bytes]]:
+    present = False
+    try:
+        with path.open("rb") as handle:
+            signature = handle.read(12)
+            if signature.startswith(b"\xff\xd8"):
+                chunks: Dict[int, bytes] = {}
+                chunk_count: Optional[int] = None
+                handle.seek(2)
+                while True:
+                    prefix = handle.read(1)
+                    if prefix != b"\xff":
+                        return present, None
+                    marker_byte = handle.read(1)
+                    while marker_byte == b"\xff":
+                        marker_byte = handle.read(1)
+                    if not marker_byte:
+                        return present, None
+                    marker = marker_byte[0]
+                    if marker in (0xDA, 0xD9):
+                        break
+                    if marker in JPEGMetadataSanitizer._STANDALONE:
+                        continue
+                    length_bytes = handle.read(2)
+                    if len(length_bytes) != 2:
+                        return present, None
+                    length = int.from_bytes(length_bytes, "big")
+                    if length < 2:
+                        return present, None
+                    payload = handle.read(length - 2)
+                    if len(payload) != length - 2:
+                        return present, None
+                    if marker != 0xE2 or not payload.startswith(
+                        JPEGMetadataSanitizer._ICC_SIGNATURE
+                    ):
+                        continue
+                    present = True
+                    header_size = len(JPEGMetadataSanitizer._ICC_SIGNATURE) + 2
+                    if len(payload) < header_size:
+                        return True, None
+                    sequence = payload[len(JPEGMetadataSanitizer._ICC_SIGNATURE)]
+                    count = payload[len(JPEGMetadataSanitizer._ICC_SIGNATURE) + 1]
+                    if sequence <= 0 or count <= 0 or sequence > count:
+                        return True, None
+                    if chunk_count is not None and chunk_count != count:
+                        return True, None
+                    chunk_count = count
+                    if sequence in chunks:
+                        return True, None
+                    chunks[sequence] = payload[header_size:]
+                if not present:
+                    return False, None
+                if chunk_count is None or set(chunks) != set(
+                    range(1, chunk_count + 1)
+                ):
+                    return True, None
+                profile = b"".join(
+                    chunks[index] for index in range(1, chunk_count + 1)
+                )
+                return True, profile or None
+            if signature[:8] == b"\x89PNG\r\n\x1a\n":
+                handle.seek(8)
+                while True:
+                    header = handle.read(8)
+                    if len(header) != 8:
+                        return present, None
+                    length = int.from_bytes(header[:4], "big")
+                    chunk = header[4:]
+                    payload = handle.read(length)
+                    crc = handle.read(4)
+                    if len(payload) != length or len(crc) != 4:
+                        return present, None
+                    expected_crc = zlib.crc32(chunk + payload) & 0xFFFFFFFF
+                    if int.from_bytes(crc, "big") != expected_crc:
+                        if chunk == b"iCCP":
+                            return True, None
+                        return present, None
+                    if chunk == b"iCCP":
+                        present = True
+                        separator = payload.find(b"\x00")
+                        if separator < 1 or separator + 2 > len(payload):
+                            return True, None
+                        if payload[separator + 1] != 0:
+                            return True, None
+                        try:
+                            profile = zlib.decompress(
+                                payload[separator + 2 :]
+                            )
+                        except zlib.error:
+                            return True, None
+                        return True, profile or None
+                    if chunk == b"IEND":
+                        return False, None
+            if signature[:4] == b"RIFF" and signature[8:12] == b"WEBP":
+                riff_size = int.from_bytes(signature[4:8], "little")
+                remaining = riff_size - 4
+                if remaining < 0:
+                    return False, None
+                while remaining > 0:
+                    if remaining < 8:
+                        return present, None
+                    header = handle.read(8)
+                    if len(header) != 8:
+                        return present, None
+                    remaining -= 8
+                    chunk = header[:4]
+                    length = int.from_bytes(header[4:], "little")
+                    padded_length = length + (length & 1)
+                    if padded_length > remaining:
+                        return present, None
+                    payload = handle.read(length)
+                    if len(payload) != length:
+                        return present, None
+                    if length & 1 and len(handle.read(1)) != 1:
+                        return present, None
+                    remaining -= padded_length
+                    if chunk == b"ICCP":
+                        return True, payload or None
+                return present, None
+    except OSError:
+        return False, None
+    return False, None
+
+
+def container_icc_profile(path: Path) -> Optional[bytes]:
+    return _container_icc_profile_state(path)[1]
+
+
+def icc_profile_sha256(profile: Optional[bytes]) -> Optional[str]:
+    return hashlib.sha256(profile).hexdigest() if profile else None
+
+
+def container_icc_profile_sha256(path: Path) -> Optional[str]:
+    return icc_profile_sha256(container_icc_profile(path))
+
+
+def container_has_icc_profile(path: Path) -> bool:
+    return _container_icc_profile_state(path)[0]
+
+
 def unique_temp_path(directory: Path, suffix: str = ".jpg", *, label: str = "tmp") -> Path:
     if not suffix.startswith("."):
         suffix = f".{suffix}"
-    return directory / f"{safe_filename(label, max_length=40)}_{uuid.uuid4().hex}{suffix}"
+    name = (
+        f"{safe_filename(label, max_length=24)}_"
+        f"{uuid.uuid4().hex[:16]}{suffix}"
+    )
+    path = directory / name
+    ensure_path_budget(path, label="Temporary path")
+    return path
 
 
 def quality_to_ffmpeg_q(quality: int) -> int:
@@ -1197,14 +1876,188 @@ def quality_to_ffmpeg_q(quality: int) -> int:
 
 
 def estimate_output_bytes(
-    original_bytes: int, quality: int, *, scale_factor: float = 1.0, strip_metadata: bool = True
+    original_bytes: int,
+    quality: int,
+    *,
+    scale_factor: float = 1.0,
+    strip_metadata: bool = True,
+    codec: ImageCodec = ImageCodec.JPG,
 ) -> int:
     q = clamp(quality, 1, 100) / 100.0
-    quality_factor = 0.22 + 0.78 * q**1.35
     scale_area = max(0.05, scale_factor**2)
-    meta_factor = 0.985 if strip_metadata else 1.0
-    est = int(original_bytes * quality_factor * scale_area * meta_factor)
+    if codec == ImageCodec.PNG:
+        if quality >= QUALITY_LOSSLESS_PROXY:
+            codec_factor = 0.97
+        else:
+            codec_factor = 0.35 + 0.65 * q
+        meta_factor = 0.97 if strip_metadata else 1.0
+    elif codec == ImageCodec.WEBP:
+        codec_factor = 0.18 + 0.82 * q**1.25
+        meta_factor = 0.985 if strip_metadata else 1.0
+    else:
+        codec_factor = 0.22 + 0.78 * q**1.35
+        meta_factor = 0.985 if strip_metadata else 1.0
+    est = int(original_bytes * codec_factor * scale_area * meta_factor)
     return max(1024, est)
+
+
+_PILLOW_CONFIGURED_MAX_PIXELS: Optional[int] = None
+
+
+def configure_pillow_pixel_limit(max_pixels: int) -> None:
+    if max_pixels <= 0:
+        raise ValueError("max_pixels must be positive")
+    if not PILLOW_AVAILABLE or Image is None:
+        return
+    global _PILLOW_CONFIGURED_MAX_PIXELS
+    if _PILLOW_CONFIGURED_MAX_PIXELS is None:
+        Image.MAX_IMAGE_PIXELS = max_pixels
+        _PILLOW_CONFIGURED_MAX_PIXELS = max_pixels
+    elif _PILLOW_CONFIGURED_MAX_PIXELS != max_pixels:
+        raise CompressorError("Pillow pixel limit was already configured")
+
+
+def pillow_open(path: Path, max_pixels: int) -> Any:
+    if not PILLOW_AVAILABLE or Image is None:
+        raise CompressorError("Pillow is not available")
+    if _PILLOW_CONFIGURED_MAX_PIXELS != max_pixels:
+        configure_pillow_pixel_limit(max_pixels)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", Image.DecompressionBombWarning)
+        return Image.open(path)
+
+
+def enforce_image_pixel_limit(
+    image: Any,
+    max_pixels: int,
+    message: str,
+) -> None:
+    width, height = image.size
+    if width <= 0 or height <= 0 or width * height > max_pixels:
+        raise ImageSafetyError(message)
+
+
+class CanvasPreparer:
+
+    def __init__(self, config: RuntimeConfig, logger: logging.Logger) -> None:
+        self.config = config
+        self.logger = logger
+
+    def prepare(
+        self,
+        probe: ImageProbeResult,
+        work_dir: Path,
+    ) -> ImageProbeResult:
+        if not probe.is_readable:
+            return probe
+        canvas = self.config.page_canvas
+        if canvas is None:
+            return probe
+        should_prepare = self.config.resize_mode == ResizeMode.ALL or (
+            self.config.resize_mode == ResizeMode.OUTLIERS
+            and probe.path in self.config.canvas_paths
+        )
+        if not should_prepare:
+            return probe
+        if not PILLOW_AVAILABLE or Image is None:
+            raise EncodeError(t("resize_requires_pillow"))
+        self.config.cancellation.raise_if_cancelled()
+        destination = unique_temp_path(work_dir, ".png", label="canvas")
+        target_codec = resolve_output_codec(probe.path, self.config.output_format)
+        with pillow_open(probe.path, self.config.max_pixels) as source_image:
+            enforce_image_pixel_limit(
+                source_image,
+                self.config.max_pixels,
+                "source image exceeds pixel limit",
+            )
+            source_info = dict(source_image.info or {})
+            source_image.load()
+            oriented = (
+                ImageOps.exif_transpose(source_image)
+                if ImageOps is not None
+                else source_image.copy()
+            )
+            source_dimensions = ImageDimensions(oriented.width, oriented.height)
+            fit_scale = min(
+                canvas.width / oriented.width,
+                canvas.height / oriented.height,
+            )
+            if not self.config.allow_upscale:
+                fit_scale = min(1.0, fit_scale)
+            fitted_width = max(1, min(canvas.width, int(round(oriented.width * fit_scale))))
+            fitted_height = max(1, min(canvas.height, int(round(oriented.height * fit_scale))))
+            fitted_size = (fitted_width, fitted_height)
+            transformation_required = fitted_size != oriented.size or fitted_size != (
+                canvas.width,
+                canvas.height,
+            )
+            if transformation_required and (probe.bit_depth or 0) > 8:
+                raise EncodeError("high-bit-depth images cannot be safely resized or padded")
+            prepared = PillowEncoder._prepare_mode(oriented, target_codec)
+            if fitted_size != prepared.size:
+                prepared = prepared.resize(
+                    fitted_size,
+                    resample=Image.Resampling.LANCZOS,
+                )
+            padded = fitted_size != (canvas.width, canvas.height)
+            if padded:
+                if target_codec == ImageCodec.JPG:
+                    background = Image.new("RGB", (canvas.width, canvas.height), (255, 255, 255))
+                elif probe.has_alpha:
+                    prepared = prepared.convert("RGBA")
+                    background = Image.new("RGBA", (canvas.width, canvas.height), (0, 0, 0, 0))
+                else:
+                    background = Image.new(prepared.mode, (canvas.width, canvas.height), 255)
+                offset = (
+                    (canvas.width - fitted_width) // 2,
+                    (canvas.height - fitted_height) // 2,
+                )
+                if target_codec == ImageCodec.JPG:
+                    background.paste(prepared, offset)
+                elif probe.has_alpha and "A" in prepared.mode:
+                    background.paste(prepared, offset)
+                else:
+                    background.paste(prepared, offset)
+                prepared = background
+            save_kwargs: Dict[str, Any] = {
+                "format": "PNG",
+                "compress_level": 1,
+            }
+            if self.config.preserve_icc_profile and probe.has_icc_profile:
+                icc_profile = source_info.get("icc_profile") or container_icc_profile(probe.path)
+                if not isinstance(icc_profile, bytes):
+                    raise EncodeError("ICC profile identity is unavailable during resize")
+                if icc_profile_sha256(icc_profile) != probe.icc_profile_sha256:
+                    raise EncodeError("ICC profile identity changed during resize preparation")
+                save_kwargs["icc_profile"] = icc_profile
+            if not self.config.strip_metadata:
+                source_exif = source_info.get("exif")
+                if source_exif:
+                    cleaned_exif = PillowEncoder._exif_without_orientation(source_exif)
+                    if cleaned_exif:
+                        save_kwargs["exif"] = cleaned_exif
+            self.config.cancellation.raise_if_cancelled()
+            prepared.save(destination, **save_kwargs)
+            prepared_mode = prepared.mode
+        if not destination.is_file() or file_size(destination) <= 0:
+            raise EncodeError("page canvas preparation failed")
+        resized = fitted_size != (source_dimensions.width, source_dimensions.height)
+        self.logger.info(
+            "Prepared page canvas %s for %s",
+            canvas,
+            probe.path.name,
+        )
+        return replace(
+            probe,
+            processing_path=destination,
+            processing_dimensions=canvas,
+            resized=resized,
+            padded=padded,
+            canvas_scale=fit_scale,
+            pixel_format=prepared_mode,
+            exif_orientation=1,
+            has_alpha=probe.has_alpha and target_codec.preserves_alpha,
+        )
 
 
 def configure_stdio_utf8() -> None:
@@ -1254,7 +2107,7 @@ def setup_logging(
         try:
             log_file.parent.mkdir(parents=True, exist_ok=True)
             fh = logging.FileHandler(log_file, encoding="utf-8")
-            fh.setLevel(logging.DEBUG)
+            fh.setLevel(level)
             fh.setFormatter(logging.Formatter(LOG_FORMAT, datefmt="%Y-%m-%d %H:%M:%S"))
             logger.addHandler(fh)
         except OSError as exc:
@@ -1328,6 +2181,40 @@ class BinaryLocator:
         return path
 
     @staticmethod
+    def probe_capabilities(
+        ffmpeg: Path,
+        runner: "SubprocessRunner",
+    ) -> FFmpegCapabilities:
+        result = runner.run(
+            [str(ffmpeg), "-hide_banner", "-encoders"],
+            timeout=15,
+            label="ffmpeg-capabilities",
+        )
+        text = (result.stdout + "\n" + result.stderr).casefold()
+        mjpeg = bool(re.search(r"\bmjpeg\b", text))
+        png = bool(re.search(r"\bpng\b", text))
+        webp = bool(re.search(r"\blibwebp\b", text))
+        help_result = runner.run(
+            [
+                str(ffmpeg),
+                "-hide_banner",
+                "-h",
+                "encoder=mjpeg",
+            ],
+            timeout=15,
+            label="mjpeg-capabilities",
+        )
+        huffman_text = (
+            help_result.stdout + "\n" + help_result.stderr
+        ).casefold()
+        return FFmpegCapabilities(
+            mjpeg=mjpeg,
+            png=png,
+            webp=webp,
+            optimal_huffman="huffman" in huffman_text,
+        )
+
+    @staticmethod
     def _read_version(binary: Path) -> str:
         proc: Optional[subprocess.Popen[str]] = None
         try:
@@ -1346,7 +2233,7 @@ class BinaryLocator:
             if proc is not None:
                 try:
                     proc.kill()
-                    proc.communicate()
+                    proc.communicate(timeout=SUBPROCESS_COLLECT_TIMEOUT_SEC)
                 except (OSError, subprocess.SubprocessError):
                     pass
             return "unknown"
@@ -1354,12 +2241,82 @@ class BinaryLocator:
             if proc is not None:
                 try:
                     proc.kill()
-                    proc.communicate()
+                    proc.communicate(timeout=SUBPROCESS_COLLECT_TIMEOUT_SEC)
                 except (OSError, subprocess.SubprocessError):
                     pass
             raise
         except (OSError, subprocess.SubprocessError):
             return "unknown"
+
+
+@dataclass(frozen=True, slots=True)
+class FFmpegCapabilities:
+    mjpeg: bool
+    png: bool
+    webp: bool
+    optimal_huffman: bool
+
+    def to_dict(self) -> Dict[str, bool]:
+        return {
+            "mjpeg": self.mjpeg,
+            "png": self.png,
+            "webp": self.webp,
+            "optimal_huffman": self.optimal_huffman,
+        }
+
+
+def available_output_codecs(
+    capabilities: FFmpegCapabilities,
+) -> frozenset[ImageCodec]:
+    codecs: set[ImageCodec] = set()
+    pillow_codecs = pillow_output_codecs()
+    if capabilities.mjpeg or ImageCodec.JPG in pillow_codecs:
+        codecs.add(ImageCodec.JPG)
+    if capabilities.png or ImageCodec.PNG in pillow_codecs:
+        codecs.add(ImageCodec.PNG)
+    if capabilities.webp or ImageCodec.WEBP in pillow_codecs:
+        codecs.add(ImageCodec.WEBP)
+    return frozenset(codecs)
+
+
+def pillow_output_codecs() -> frozenset[ImageCodec]:
+    if not PILLOW_AVAILABLE or Image is None:
+        return frozenset()
+    formats = set(Image.registered_extensions().values())
+    codecs: set[ImageCodec] = set()
+    if "JPEG" in formats:
+        codecs.add(ImageCodec.JPG)
+    if "PNG" in formats:
+        codecs.add(ImageCodec.PNG)
+    if (
+        "WEBP" in formats
+        and PillowFeatures is not None
+        and PillowFeatures.check("webp")
+    ):
+        codecs.add(ImageCodec.WEBP)
+    return frozenset(codecs)
+
+
+def output_choice_available(
+    choice: OutputFormatChoice,
+    summary: PreflightSummary,
+    codecs: frozenset[ImageCodec],
+) -> bool:
+    if choice == OutputFormatChoice.JPG:
+        return ImageCodec.JPG in codecs and (
+            ImageCodec.JPG in pillow_output_codecs()
+            or not any(image.has_alpha for image in summary.images if image.is_readable)
+        )
+    if choice == OutputFormatChoice.PNG:
+        return ImageCodec.PNG in codecs
+    if choice == OutputFormatChoice.WEBP:
+        return ImageCodec.WEBP in codecs
+    required = {
+        resolve_output_codec(image.path, choice)
+        for image in summary.images
+        if image.is_readable
+    }
+    return required.issubset(codecs)
 
 
 @dataclass(slots=True)
@@ -1391,7 +2348,6 @@ class SubprocessRunner:
         self.cancellation = cancellation or CancellationToken()
         self._lock = threading.Lock()
         self._active: set[subprocess.Popen[str]] = set()
-        self.call_count = 0
 
     def run(
         self,
@@ -1410,7 +2366,6 @@ class SubprocessRunner:
             merged_env.update(dict(env))
         merged_env.setdefault("AV_LOG_FORCE_NOCOLOR", "1")
         self.cancellation.raise_if_cancelled()
-        self.logger.debug("[%s] exec: %s", label, " ".join(argv_list))
         t0 = time.perf_counter()
         popen_kwargs: Dict[str, Any] = {}
         if os.name == "nt":
@@ -1442,7 +2397,6 @@ class SubprocessRunner:
                     cause=exc,
                 ) from exc
             self._active.add(proc)
-            self.call_count += 1
         timed_out = False
         cancelled = False
         stdout = ""
@@ -1456,19 +2410,35 @@ class SubprocessRunner:
                 except subprocess.TimeoutExpired:
                     if self.cancellation.cancelled:
                         cancelled = True
-                        self._stop_process(proc)
-                        stdout, stderr = proc.communicate()
+                        if not self._stop_process(proc):
+                            raise ProcessTerminationError(
+                                f"Could not confirm process termination: pid={proc.pid}"
+                            )
+                        stdout, stderr = self._collect_output(proc)
                         break
                     if time.perf_counter() >= deadline:
                         timed_out = True
-                        self._stop_process(proc)
-                        stdout, stderr = proc.communicate()
+                        if not self._stop_process(proc):
+                            raise ProcessTerminationError(
+                                f"Could not confirm process termination: pid={proc.pid}"
+                            )
+                        stdout, stderr = self._collect_output(proc)
                         break
             if self.cancellation.cancelled:
                 cancelled = True
+        except BaseException as exc:
+            if isinstance(exc, ProcessTerminationError):
+                raise
+            if proc.poll() is None and not self._stop_process(proc):
+                raise ProcessTerminationError(
+                    f"Could not confirm process termination after "
+                    f"{type(exc).__name__}: pid={proc.pid}"
+                ) from exc
+            raise
         finally:
-            with self._lock:
-                self._active.discard(proc)
+            if proc.poll() is not None:
+                with self._lock:
+                    self._active.discard(proc)
 
         elapsed = time.perf_counter() - t0
         if timed_out:
@@ -1486,40 +2456,55 @@ class SubprocessRunner:
             cancelled=cancelled,
         )
         if not result.ok:
-            self.logger.debug(
-                "[%s] failed rc=%s in %.2fs stderr=%s",
-                label,
-                result.returncode,
-                elapsed,
-                result.stderr[:500],
-            )
             if check:
                 raise EncodeError(
                     f"{label} failed (rc={result.returncode}): {(result.stderr or result.stdout)[:800]}"
                 )
-        else:
-            self.logger.debug("[%s] ok in %.2fs", label, elapsed)
         return result
 
-    @staticmethod
-    def _stop_process(proc: subprocess.Popen[str]) -> None:
-        if proc.poll() is not None:
-            return
+    @classmethod
+    def _collect_output(
+        cls,
+        proc: subprocess.Popen[str],
+    ) -> Tuple[str, str]:
         try:
-            if os.name == "nt":
-                proc.send_signal(signal.CTRL_BREAK_EVENT)
-            else:
-                os.killpg(proc.pid, signal.SIGTERM)
-        except (OSError, ValueError):
-            try:
-                proc.terminate()
-            except OSError:
-                return
-        try:
-            proc.wait(timeout=2.0)
-            return
+            return proc.communicate(timeout=SUBPROCESS_COLLECT_TIMEOUT_SEC)
         except subprocess.TimeoutExpired:
-            pass
+            if not cls._stop_process(proc):
+                raise ProcessTerminationError(
+                    f"Could not confirm process termination: pid={proc.pid}"
+                )
+            try:
+                return proc.communicate(
+                    timeout=SUBPROCESS_COLLECT_TIMEOUT_SEC
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise ProcessTerminationError(
+                    f"Process output pipes remained open after termination: "
+                    f"pid={proc.pid}"
+                ) from exc
+
+    @staticmethod
+    def _stop_process(proc: subprocess.Popen[str]) -> bool:
+        process_exited = proc.poll() is not None
+        if not process_exited:
+            try:
+                if os.name == "nt":
+                    proc.send_signal(signal.CTRL_BREAK_EVENT)
+                else:
+                    os.killpg(proc.pid, signal.SIGTERM)
+            except (OSError, ValueError):
+                try:
+                    proc.terminate()
+                except OSError:
+                    pass
+            try:
+                proc.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                pass
+            process_exited = proc.poll() is not None
+        if process_exited:
+            return True
         try:
             if os.name == "nt":
                 subprocess.run(
@@ -1532,32 +2517,44 @@ class SubprocessRunner:
             else:
                 os.killpg(proc.pid, signal.SIGKILL)
         except (OSError, subprocess.SubprocessError):
+            pass
+        if proc.poll() is None:
             try:
                 proc.kill()
             except OSError:
-                return
+                pass
         try:
             proc.wait(timeout=2.0)
         except subprocess.TimeoutExpired:
             pass
+        return proc.poll() is not None
 
     def cancel_all(self) -> None:
         self.cancellation.cancel()
         with self._lock:
             active = list(self._active)
         for proc in active:
-            try:
-                self._stop_process(proc)
-            except OSError:
-                pass
+            if not self._stop_process(proc):
+                self.logger.error(
+                    "Could not confirm process termination: pid=%s",
+                    proc.pid,
+                )
 
 
 class ImageProber:
 
-    def __init__(self, ffprobe: Path, runner: SubprocessRunner, logger: logging.Logger) -> None:
+    def __init__(
+        self,
+        ffprobe: Path,
+        runner: SubprocessRunner,
+        *,
+        max_pixels: int = DEFAULT_MAX_PIXELS,
+    ) -> None:
+        if max_pixels <= 0:
+            raise ValueError("max_pixels must be positive")
         self.ffprobe = ffprobe
         self.runner = runner
-        self.logger = logger
+        self.max_pixels = max_pixels
 
     def probe(self, path: Path) -> ImageProbeResult:
         path = Path(path)
@@ -1599,7 +2596,14 @@ class ImageProber:
                     result.has_metadata_hint = (
                         result.has_metadata_hint or pillow_result.has_metadata_hint
                     )
-                    result.has_icc_profile = pillow_result.has_icc_profile
+                    result.has_icc_profile = (
+                        result.has_icc_profile
+                        or pillow_result.has_icc_profile
+                    )
+                    result.icc_profile_sha256 = (
+                        pillow_result.icc_profile_sha256
+                        or result.icc_profile_sha256
+                    )
                     result.has_alpha = (
                         result.has_alpha or pillow_result.has_alpha
                     )
@@ -1615,21 +2619,85 @@ class ImageProber:
                         and pillow_result.bit_depth is not None
                     ):
                         result.bit_depth = pillow_result.bit_depth
-                except UserAbortError:
+                except (UserAbortError, ImageSafetyError):
                     raise
-                except Exception as exc:
-                    self.logger.debug("Pillow metadata probe failed for %s: %s", path.name, exc)
+                except ProbeError as exc:
+                    return ImageProbeResult(
+                        path=path,
+                        size_bytes=size,
+                        dimensions=None,
+                        codec_name=result.codec_name,
+                        pixel_format=result.pixel_format,
+                        color_space=result.color_space,
+                        bit_depth=result.bit_depth,
+                        is_readable=False,
+                        is_jpeg=result.is_jpeg,
+                        has_metadata_hint=result.has_metadata_hint,
+                        has_icc_profile=(
+                            result.has_icc_profile
+                            or container_has_icc_profile(path)
+                        ),
+                        icc_profile_sha256=(
+                            result.icc_profile_sha256
+                            or container_icc_profile_sha256(path)
+                        ),
+                        has_alpha=result.has_alpha,
+                        probe_error=str(exc),
+                        format_name=result.format_name,
+                        duration=result.duration,
+                    )
+            container_icc_present, container_icc = (
+                _container_icc_profile_state(path)
+            )
+            result.has_icc_profile = (
+                result.has_icc_profile or container_icc_present
+            )
+            result.icc_profile_sha256 = (
+                result.icc_profile_sha256
+                or icc_profile_sha256(container_icc)
+            )
             return result
-        except UserAbortError:
+        except (UserAbortError, ProcessTerminationError):
             raise
+        except ImageSafetyError as exc:
+            return ImageProbeResult(
+                path=path,
+                size_bytes=size,
+                dimensions=None,
+                codec_name=None,
+                pixel_format=None,
+                color_space=None,
+                bit_depth=None,
+                is_readable=False,
+                is_jpeg=path.suffix.lower() in JPEG_EXTENSIONS,
+                has_metadata_hint=False,
+                has_icc_profile=container_has_icc_profile(path),
+                icc_profile_sha256=container_icc_profile_sha256(path),
+                probe_error=str(exc),
+            )
         except (ProbeError, CompressorError, json.JSONDecodeError, KeyError, TypeError) as exc:
             self.runner.cancellation.raise_if_cancelled()
-            self.logger.debug("ffprobe failed for %s: %s — trying Pillow", path.name, exc)
             if PILLOW_AVAILABLE:
                 try:
                     return self._probe_pillow(path, size)
                 except UserAbortError:
                     raise
+                except ImageSafetyError as pillow_exc:
+                    return ImageProbeResult(
+                        path=path,
+                        size_bytes=size,
+                        dimensions=None,
+                        codec_name=None,
+                        pixel_format=None,
+                        color_space=None,
+                        bit_depth=None,
+                        is_readable=False,
+                        is_jpeg=path.suffix.lower() in JPEG_EXTENSIONS,
+                        has_metadata_hint=False,
+                        has_icc_profile=container_has_icc_profile(path),
+                        icc_profile_sha256=container_icc_profile_sha256(path),
+                        probe_error=str(pillow_exc),
+                    )
                 except Exception as pillow_exc:
                     return ImageProbeResult(
                         path=path,
@@ -1698,6 +2766,7 @@ class ImageProber:
         is_readable = dims is not None and dims.width > 0
         if not is_readable:
             raise ProbeError(f"No valid video/image stream in {path.name}")
+        self._enforce_pixel_limit(dims, path)
         return ImageProbeResult(
             path=path,
             size_bytes=size,
@@ -1715,13 +2784,24 @@ class ImageProber:
         )
 
     def _probe_pillow(self, path: Path, size: int) -> ImageProbeResult:
-        assert PILLOW_AVAILABLE and Image is not None
+        if not PILLOW_AVAILABLE or Image is None:
+            raise ProbeError("Pillow is not available")
         try:
             self.runner.cancellation.raise_if_cancelled()
-            with Image.open(path) as img:
+            with pillow_open(path, self.max_pixels) as img:
+                enforce_image_pixel_limit(
+                    img,
+                    self.max_pixels,
+                    f"Image exceeds safe pixel limits: {path.name}",
+                )
                 img.verify()
             self.runner.cancellation.raise_if_cancelled()
-            with Image.open(path) as img:
+            with pillow_open(path, self.max_pixels) as img:
+                enforce_image_pixel_limit(
+                    img,
+                    self.max_pixels,
+                    f"Image exceeds safe pixel limits: {path.name}",
+                )
                 fmt = (img.format or "").upper()
                 mode = img.mode
                 info = dict(img.info or {})
@@ -1729,28 +2809,45 @@ class ImageProber:
                     orientation = int(img.getexif().get(274, 1) or 1)
                 except (AttributeError, TypeError, ValueError):
                     orientation = 1
-                oriented = ImageOps.exif_transpose(img) if ImageOps is not None else img
-                width, height = oriented.size
+                width, height = img.size
+                if orientation in (5, 6, 7, 8):
+                    width, height = height, width
+            dimensions = ImageDimensions(width, height)
+            self._enforce_pixel_limit(dimensions, path)
             self.runner.cancellation.raise_if_cancelled()
         except UserAbortError:
             raise
+        except (Image.DecompressionBombWarning, Image.DecompressionBombError) as exc:
+            raise ImageSafetyError(
+                f"Image exceeds safe pixel limits: {path.name}",
+                cause=exc,
+            ) from exc
         except Exception as exc:
             raise ProbeError(
                 f"Pillow cannot open {path.name}: {exc}",
                 cause=exc,
             ) from exc
+        icc_profile = info.get("icc_profile")
+        container_icc_present, container_icc = (
+            _container_icc_profile_state(path)
+        )
         return ImageProbeResult(
             path=path,
             size_bytes=size,
-            dimensions=ImageDimensions(width, height),
+            dimensions=dimensions,
             codec_name=fmt.lower() if fmt else None,
             pixel_format=mode,
             color_space=None,
             bit_depth=self._pillow_bit_depth(mode),
             is_readable=True,
             is_jpeg=fmt in {"JPEG", "MPO"} or path.suffix.lower() in JPEG_EXTENSIONS,
-            has_metadata_hint=bool(info.get("exif") or info.get("icc_profile")),
-            has_icc_profile=bool(info.get("icc_profile")),
+            has_metadata_hint=bool(info.get("exif") or icc_profile),
+            has_icc_profile=bool(
+                icc_profile or container_icc_present
+            ),
+            icc_profile_sha256=icc_profile_sha256(
+                icc_profile or container_icc
+            ),
             has_alpha=(
                 "A" in mode
                 or (
@@ -1761,6 +2858,17 @@ class ImageProber:
             exif_orientation=orientation,
             format_name=fmt.lower() if fmt else None,
         )
+
+    def _enforce_pixel_limit(
+        self,
+        dimensions: ImageDimensions,
+        path: Path,
+    ) -> None:
+        pixels = dimensions.width * dimensions.height
+        if pixels > self.max_pixels:
+            raise ImageSafetyError(
+                f"Image has {pixels:,} pixels; limit is {self.max_pixels:,}: {path.name}"
+            )
 
     @staticmethod
     def _pillow_bit_depth(mode: str) -> Optional[int]:
@@ -1818,7 +2926,6 @@ class ImageProber:
         pillow_pixel_format: Optional[str],
     ) -> Optional[str]:
         ffmpeg_value = (ffprobe_pixel_format or "").casefold()
-        pillow_value = (pillow_pixel_format or "").upper()
         if any(
             marker in ffmpeg_value
             for marker in ("420", "422", "444", "rgb", "bgr", "gbr")
@@ -1827,46 +2934,376 @@ class ImageProber:
         return pillow_pixel_format or ffprobe_pixel_format
 
 
-class Encoder(ABC):
-    name: str
+class OutputVerifier:
 
-    @abstractmethod
-    def encode_image(
+    def __init__(
         self,
-        source: Path,
-        destination: Path,
+        ffmpeg: Path,
+        ffprobe: Path,
+        runner: SubprocessRunner,
         *,
-        codec: ImageCodec,
-        quality: int,
-        scale_factor: float = 1.0,
-        target_dimensions: Optional[ImageDimensions] = None,
-        strip_metadata: bool = True,
-        preserve_icc_profile: bool = True,
-        progressive: bool = True,
-        source_pixel_format: Optional[str] = None,
-        source_orientation: int = 1,
-        source_has_icc_profile: Optional[bool] = None,
-        source_bit_depth: Optional[int] = None,
-        source_has_alpha: bool = False,
-    ) -> CompressionAttempt:
-        pass
+        max_pixels: int = DEFAULT_MAX_PIXELS,
+    ) -> None:
+        if max_pixels <= 0:
+            raise ValueError("max_pixels must be positive")
+        self.ffmpeg = ffmpeg
+        self.ffprobe = ffprobe
+        self.runner = runner
+        self.max_pixels = max_pixels
+
+    def verify(
+        self,
+        path: Path,
+        *,
+        expected_codec: ImageCodec,
+        expected_dimensions: Optional[ImageDimensions],
+        require_alpha: bool,
+        require_icc: bool,
+        size_policy: SizePolicy,
+        expected_icc_sha256: Optional[str] = None,
+        enforce_size: bool = True,
+    ) -> OutputVerification:
+        size = file_size(path)
+        size_acceptable = size_policy.is_acceptable(size)
+        if PILLOW_AVAILABLE and Image is not None:
+            pillow_verification = self._verify_pillow(path, size)
+            if pillow_verification.valid:
+                verified = pillow_verification
+            else:
+                ffmpeg_verification = self._verify_ffmpeg(path, size)
+                if ffmpeg_verification.valid:
+                    verified = ffmpeg_verification
+                else:
+                    verified = OutputVerification(
+                        False,
+                        ffmpeg_verification.codec,
+                        ffmpeg_verification.dimensions,
+                        ffmpeg_verification.has_alpha,
+                        ffmpeg_verification.has_icc_profile,
+                        size,
+                        "pillow+ffmpeg",
+                        (
+                            f"pillow: {pillow_verification.error}; "
+                            f"ffmpeg: {ffmpeg_verification.error}"
+                        )[:600],
+                        ffmpeg_verification.icc_profile_sha256,
+                    )
+        else:
+            verified = self._verify_ffmpeg(path, size)
+        if not verified.valid:
+            return OutputVerification(
+                False,
+                verified.codec,
+                verified.dimensions,
+                verified.has_alpha,
+                verified.has_icc_profile,
+                size,
+                verified.decoder,
+                verified.error,
+                verified.icc_profile_sha256,
+                False,
+                size_acceptable,
+            )
+        if verified.codec != expected_codec:
+            return self._failure(
+                verified,
+                "unexpected_codec",
+                size_acceptable=size_acceptable,
+            )
+        if expected_dimensions and verified.dimensions != expected_dimensions:
+            return self._failure(
+                verified,
+                "unexpected_dimensions",
+                size_acceptable=size_acceptable,
+            )
+        if require_alpha and verified.has_alpha is not True:
+            return self._failure(
+                verified,
+                "alpha_not_preserved",
+                size_acceptable=size_acceptable,
+            )
+        if expected_codec == ImageCodec.JPG and verified.has_alpha is True:
+            return self._failure(
+                verified,
+                "jpeg_output_has_alpha",
+                size_acceptable=size_acceptable,
+            )
+        if require_icc and expected_icc_sha256 is None:
+            return self._failure(
+                verified,
+                "icc_identity_unavailable",
+                size_acceptable=size_acceptable,
+            )
+        if require_icc and verified.has_icc_profile is not True:
+            return self._failure(
+                verified,
+                "icc_not_preserved",
+                size_acceptable=size_acceptable,
+            )
+        if require_icc and verified.icc_profile_sha256 is None:
+            return self._failure(
+                verified,
+                "icc_identity_unavailable",
+                size_acceptable=size_acceptable,
+            )
+        if (
+            require_icc
+            and verified.icc_profile_sha256 != expected_icc_sha256
+        ):
+            return self._failure(
+                verified,
+                "icc_profile_mismatch",
+                size_acceptable=size_acceptable,
+            )
+        return OutputVerification(
+            valid=not enforce_size or size_acceptable,
+            codec=verified.codec,
+            dimensions=verified.dimensions,
+            has_alpha=verified.has_alpha,
+            has_icc_profile=verified.has_icc_profile,
+            size_bytes=verified.size_bytes,
+            decoder=verified.decoder,
+            error=(
+                None
+                if not enforce_size or size_acceptable
+                else "strict_size_limit_failed"
+            ),
+            icc_profile_sha256=verified.icc_profile_sha256,
+            structurally_valid=True,
+            size_acceptable=size_acceptable,
+        )
+
+    @staticmethod
+    def _failure(
+        verified: OutputVerification,
+        error: str,
+        *,
+        size_acceptable: Optional[bool] = None,
+    ) -> OutputVerification:
+        return OutputVerification(
+            False,
+            verified.codec,
+            verified.dimensions,
+            verified.has_alpha,
+            verified.has_icc_profile,
+            verified.size_bytes,
+            verified.decoder,
+            error,
+            verified.icc_profile_sha256,
+            False,
+            (
+                verified.size_acceptable
+                if size_acceptable is None
+                else size_acceptable
+            ),
+        )
+
+    def _verify_pillow(
+        self,
+        path: Path,
+        size: int,
+    ) -> OutputVerification:
+        if not PILLOW_AVAILABLE or Image is None:
+            return OutputVerification(
+                False,
+                None,
+                None,
+                None,
+                None,
+                size,
+                "pillow",
+                "Pillow is not available",
+            )
+        try:
+            self.runner.cancellation.raise_if_cancelled()
+            with pillow_open(path, self.max_pixels) as image:
+                enforce_image_pixel_limit(
+                    image,
+                    self.max_pixels,
+                    "verified output exceeds pixel limit",
+                )
+                image.load()
+                fmt = (image.format or "").upper()
+                width, height = image.size
+                orientation = int(image.getexif().get(274, 1) or 1)
+                if orientation in (5, 6, 7, 8):
+                    width, height = height, width
+                dimensions = ImageDimensions(width, height)
+                has_alpha = (
+                    "A" in image.mode
+                    or (
+                        image.mode == "P"
+                        and "transparency" in image.info
+                    )
+                )
+                icc_profile = image.info.get("icc_profile")
+            codec = {
+                "JPEG": ImageCodec.JPG,
+                "MPO": ImageCodec.JPG,
+                "PNG": ImageCodec.PNG,
+                "WEBP": ImageCodec.WEBP,
+            }.get(fmt)
+            container_icc_present, container_icc = (
+                _container_icc_profile_state(path)
+            )
+            output_icc = icc_profile or container_icc
+            return OutputVerification(
+                True,
+                codec,
+                dimensions,
+                has_alpha,
+                bool(icc_profile or container_icc_present),
+                size,
+                "pillow",
+                icc_profile_sha256=icc_profile_sha256(output_icc),
+                structurally_valid=True,
+            )
+        except UserAbortError:
+            raise
+        except Exception as exc:
+            return OutputVerification(
+                False,
+                None,
+                None,
+                None,
+                None,
+                size,
+                "pillow",
+                f"{type(exc).__name__}: {exc}",
+            )
+
+    def _verify_ffmpeg(
+        self,
+        path: Path,
+        size: int,
+    ) -> OutputVerification:
+        decode = self.runner.run(
+            [
+                str(self.ffmpeg),
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-threads",
+                str(FFMPEG_PROCESS_THREADS),
+                "-i",
+                str(path),
+                "-frames:v",
+                "1",
+                "-f",
+                "null",
+                "-",
+            ],
+            timeout=PROBE_TIMEOUT_SEC,
+            label=f"verify:{path.name}",
+        )
+        if not decode.ok:
+            return OutputVerification(
+                False,
+                None,
+                None,
+                None,
+                container_has_icc_profile(path),
+                size,
+                "ffmpeg",
+                (decode.stderr or decode.stdout or "decode_failed")[:600],
+            )
+        probe = self.runner.run(
+            [
+                str(self.ffprobe),
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=codec_name,width,height,pix_fmt",
+                "-of",
+                "json",
+                str(path),
+            ],
+            timeout=PROBE_TIMEOUT_SEC,
+            label=f"verify-probe:{path.name}",
+        )
+        if not probe.ok:
+            return self._failure(
+                OutputVerification(
+                    True,
+                    None,
+                    None,
+                    None,
+                    container_has_icc_profile(path),
+                    size,
+                    "ffmpeg",
+                ),
+                "verification_probe_failed",
+            )
+        try:
+            stream = (json.loads(probe.stdout).get("streams") or [])[0]
+            codec = {
+                "mjpeg": ImageCodec.JPG,
+                "jpeg": ImageCodec.JPG,
+                "png": ImageCodec.PNG,
+                "webp": ImageCodec.WEBP,
+            }.get(str(stream.get("codec_name") or "").casefold())
+            dimensions = ImageDimensions(
+                int(stream["width"]),
+                int(stream["height"]),
+            )
+            if dimensions.width * dimensions.height > self.max_pixels:
+                raise ImageSafetyError("verified output exceeds pixel limit")
+            has_alpha = ImageProber._pixel_format_has_alpha(
+                stream.get("pix_fmt")
+            )
+        except (
+            IndexError,
+            KeyError,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+            ImageSafetyError,
+        ) as exc:
+            return self._failure(
+                OutputVerification(
+                    True,
+                    None,
+                    None,
+                    None,
+                    container_has_icc_profile(path),
+                    size,
+                    "ffmpeg",
+                ),
+                f"invalid_verification_probe: {exc}",
+            )
+        container_icc_present, container_icc = (
+            _container_icc_profile_state(path)
+        )
+        return OutputVerification(
+            True,
+            codec,
+            dimensions,
+            has_alpha,
+            container_icc_present,
+            size,
+            "ffmpeg",
+            icc_profile_sha256=icc_profile_sha256(container_icc),
+            structurally_valid=True,
+        )
 
 
-class FFmpegEncoder(Encoder):
+class FFmpegEncoder:
     name = "ffmpeg"
 
     def __init__(
         self,
         ffmpeg: Path,
         runner: SubprocessRunner,
-        logger: logging.Logger,
         *,
         timeout: float = ENCODE_TIMEOUT_SEC,
+        capabilities: Optional[FFmpegCapabilities] = None,
     ) -> None:
         self.ffmpeg = ffmpeg
         self.runner = runner
-        self.logger = logger
         self.timeout = timeout
+        self.capabilities = capabilities
 
     def encode_image(
         self,
@@ -1881,37 +3318,91 @@ class FFmpegEncoder(Encoder):
         preserve_icc_profile: bool = True,
         progressive: bool = True,
         source_pixel_format: Optional[str] = None,
-        source_orientation: int = 1,
         source_has_icc_profile: Optional[bool] = None,
-        source_bit_depth: Optional[int] = None,
         source_has_alpha: bool = False,
+        webp_variant: WebPVariant = WebPVariant.LOSSY,
+        webp_method: int = WEBP_SEARCH_METHOD,
+        png_colors: Optional[int] = None,
     ) -> CompressionAttempt:
-        del preserve_icc_profile, progressive, source_orientation
-        del source_has_icc_profile, source_bit_depth, source_has_alpha
         destination.parent.mkdir(parents=True, exist_ok=True)
         self.runner.cancellation.raise_if_cancelled()
+        if png_colors is not None:
+            return CompressionAttempt(
+                backend=EncodeBackend.FFMPEG,
+                quality=quality,
+                ffmpeg_q=None,
+                scale_factor=scale_factor,
+                output_bytes=0,
+                elapsed_sec=0.0,
+                success=False,
+                error="FFmpeg palette PNG encoding is unavailable",
+                dimensions=target_dimensions,
+                png_colors=png_colors,
+            )
+        if preserve_icc_profile and source_has_icc_profile:
+            return CompressionAttempt(
+                backend=EncodeBackend.FFMPEG,
+                quality=quality,
+                ffmpeg_q=None,
+                scale_factor=scale_factor,
+                output_bytes=0,
+                elapsed_sec=0.0,
+                success=False,
+                error="FFmpeg cannot safely preserve ICC profile identity",
+                dimensions=target_dimensions,
+            )
+        if codec == ImageCodec.JPG and source_has_alpha:
+            return CompressionAttempt(
+                backend=EncodeBackend.FFMPEG,
+                quality=quality,
+                ffmpeg_q=None,
+                scale_factor=scale_factor,
+                output_bytes=0,
+                elapsed_sec=0.0,
+                success=False,
+                error="Pillow is required to flatten transparency onto white",
+                dimensions=target_dimensions,
+            )
+        if not self._supports(codec):
+            return CompressionAttempt(
+                backend=EncodeBackend.FFMPEG,
+                quality=quality,
+                ffmpeg_q=(
+                    quality_to_ffmpeg_q(quality)
+                    if codec == ImageCodec.JPG
+                    else None
+                ),
+                scale_factor=scale_factor,
+                output_bytes=0,
+                elapsed_sec=0.0,
+                success=False,
+                error=f"FFmpeg encoder is unavailable for {codec.value}",
+                dimensions=target_dimensions,
+            )
         t0 = time.perf_counter()
         q_v = quality_to_ffmpeg_q(quality)
-        vf_parts: List[str] = []
         out_dims = target_dimensions
-        if target_dimensions is not None:
-            vf_parts.append(
-                f"scale={target_dimensions.width}:{target_dimensions.height}:flags=lanczos"
-            )
-        elif scale_factor < 0.999:
-            vf_parts.append(
-                f"scale=trunc(iw*{scale_factor}/2)*2:trunc(ih*{scale_factor}/2)*2:flags=lanczos"
-            )
-
-        base = self._base_args(source, vf_parts=vf_parts, strip_metadata=strip_metadata)
+        base = self._base_args(source, strip_metadata=strip_metadata)
         codec_args = self._codec_args(
             codec,
             quality=quality,
             q_v=q_v,
-            huffman=True,
+            huffman=(
+                self.capabilities.optimal_huffman
+                if self.capabilities is not None
+                else True
+            ),
             source_pixel_format=source_pixel_format,
+            webp_variant=webp_variant,
+            webp_method=webp_method,
         )
-        argv = [*base, *codec_args, str(destination)]
+        argv = [
+            *base,
+            *codec_args,
+            "-threads",
+            str(FFMPEG_PROCESS_THREADS),
+            str(destination),
+        ]
         result = self.runner.run(argv, timeout=self.timeout, label=f"ffmpeg-enc:{source.name}")
         if result.cancelled:
             try:
@@ -1932,7 +3423,11 @@ class FFmpegEncoder(Encoder):
                     q_v=q_v,
                     huffman=False,
                     source_pixel_format=source_pixel_format,
+                    webp_variant=webp_variant,
+                    webp_method=webp_method,
                 ),
+                "-threads",
+                str(FFMPEG_PROCESS_THREADS),
                 str(destination),
             ]
             result = self.runner.run(
@@ -1963,10 +3458,43 @@ class FFmpegEncoder(Encoder):
             error=None if success else (result.stderr or result.stdout or "encode_failed")[:600],
             dimensions=out_dims,
             output_path=destination if success else None,
+            variant=(
+                f"{webp_variant.value}-method-{webp_method}"
+                if codec == ImageCodec.WEBP
+                else "baseline-ffmpeg-fallback"
+                if codec == ImageCodec.JPG and progressive
+                else "baseline"
+                if codec == ImageCodec.JPG
+                else None
+            ),
+            webp_method=webp_method if codec == ImageCodec.WEBP else None,
+            transient_failure=(
+                not success
+                and (
+                    result.timed_out
+                    or any(
+                        marker in (result.stderr or "").casefold()
+                        for marker in (
+                            "resource temporarily unavailable",
+                            "i/o error",
+                            "input/output error",
+                        )
+                    )
+                )
+            ),
         )
 
+    def _supports(self, codec: ImageCodec) -> bool:
+        if self.capabilities is None:
+            return True
+        return {
+            ImageCodec.JPG: self.capabilities.mjpeg,
+            ImageCodec.PNG: self.capabilities.png,
+            ImageCodec.WEBP: self.capabilities.webp,
+        }[codec]
+
     def _base_args(
-        self, source: Path, *, vf_parts: Sequence[str], strip_metadata: bool
+        self, source: Path, *, strip_metadata: bool
     ) -> List[str]:
         argv = [
             str(self.ffmpeg),
@@ -1980,8 +3508,6 @@ class FFmpegEncoder(Encoder):
             "-frames:v",
             "1",
         ]
-        if vf_parts:
-            argv.extend(["-vf", ",".join(vf_parts)])
         if strip_metadata:
             argv.extend(["-map_metadata", "-1"])
         return argv
@@ -1994,6 +3520,8 @@ class FFmpegEncoder(Encoder):
         q_v: int,
         huffman: bool,
         source_pixel_format: Optional[str] = None,
+        webp_variant: WebPVariant = WebPVariant.LOSSY,
+        webp_method: int = WEBP_SEARCH_METHOD,
     ) -> List[str]:
         if codec == ImageCodec.JPG:
             pixel_format = FFmpegEncoder._jpeg_pixel_format(
@@ -2014,7 +3542,10 @@ class FFmpegEncoder(Encoder):
             return argv
         if codec == ImageCodec.PNG:
             return ["-c:v", "png", "-compression_level", "9"]
-        webp_q, lossless = quality_to_webp_params(quality)
+        webp_q, lossless = quality_to_webp_params(
+            quality,
+            webp_variant,
+        )
         return [
             "-c:v",
             "libwebp",
@@ -2023,7 +3554,7 @@ class FFmpegEncoder(Encoder):
             "-lossless",
             "1" if lossless else "0",
             "-compression_level",
-            "6",
+            str(webp_method),
         ]
 
     @staticmethod
@@ -2050,19 +3581,61 @@ class FFmpegEncoder(Encoder):
         )
 
 
-class PillowEncoder(Encoder):
+class PillowEncoder:
     name = "pillow"
 
     def __init__(
         self,
-        logger: logging.Logger,
         *,
         cancellation: Optional[CancellationToken] = None,
+        max_pixels: int = DEFAULT_MAX_PIXELS,
     ) -> None:
         if not PILLOW_AVAILABLE:
             raise CompressorError("Pillow is not installed")
-        self.logger = logger
+        if max_pixels <= 0:
+            raise ValueError("max_pixels must be positive")
         self.cancellation = cancellation or CancellationToken()
+        self.max_pixels = max_pixels
+        self._source_cache = threading.local()
+
+    @contextmanager
+    def _source_image(self, source: Path) -> Any:
+        stat_result = source.stat()
+        key = (str(source.resolve()), stat_result.st_size, stat_result.st_mtime_ns)
+        cached_key = getattr(self._source_cache, "key", None)
+        cached_image = getattr(self._source_cache, "image", None)
+        if cached_key != key or cached_image is None:
+            if cached_image is not None:
+                cached_image.close()
+            loaded = pillow_open(source, self.max_pixels)
+            try:
+                enforce_image_pixel_limit(
+                    loaded,
+                    self.max_pixels,
+                    "source image exceeds pixel limit",
+                )
+                loaded.load()
+            except BaseException:
+                loaded.close()
+                raise
+            self._source_cache.key = key
+            self._source_cache.image = loaded
+            cached_image = loaded
+        image_copy = cached_image.copy()
+        try:
+            yield image_copy, dict(cached_image.info or {})
+        finally:
+            image_copy.close()
+
+    def release_source(self, source: Path) -> None:
+        cached_key = getattr(self._source_cache, "key", None)
+        cached_image = getattr(self._source_cache, "image", None)
+        if cached_key is None or cached_key[0] != str(source.resolve()):
+            return
+        if cached_image is not None:
+            cached_image.close()
+        self._source_cache.key = None
+        self._source_cache.image = None
 
     def encode_image(
         self,
@@ -2081,46 +3654,50 @@ class PillowEncoder(Encoder):
         source_has_icc_profile: Optional[bool] = None,
         source_bit_depth: Optional[int] = None,
         source_has_alpha: bool = False,
+        webp_variant: WebPVariant = WebPVariant.LOSSY,
+        webp_method: int = WEBP_SEARCH_METHOD,
+        png_colors: Optional[int] = None,
     ) -> CompressionAttempt:
-        del source_orientation, source_has_icc_profile
-        del source_bit_depth, source_has_alpha
-        assert Image is not None
+        if Image is None:
+            raise CompressorError("Pillow is not available")
+        if source_orientation not in range(0, 9):
+            raise EncodeError("invalid EXIF orientation")
+        if preserve_icc_profile and source_has_icc_profile is None:
+            raise EncodeError("ICC preservation state is unknown")
         t0 = time.perf_counter()
         quality = clamp(int(quality), 1, 100)
         out_dims: Optional[ImageDimensions] = None
         try:
             self.cancellation.raise_if_cancelled()
-            with Image.open(source) as img:
-                source_info = dict(img.info or {})
+            with self._source_image(source) as source_data:
+                source_image, source_info = source_data
                 icc_profile = source_info.get("icc_profile")
                 source_exif = source_info.get("exif")
-                if ImageOps is not None:
-                    img = ImageOps.exif_transpose(img)
+                img = (
+                    ImageOps.exif_transpose(source_image)
+                    if ImageOps is not None
+                    else source_image
+                )
                 img = self._prepare_mode(img, codec)
+                if (
+                    source_has_alpha
+                    and codec.preserves_alpha
+                    and "A" not in img.mode
+                    and not (img.mode == "P" and "transparency" in img.info)
+                ):
+                    raise EncodeError("source alpha channel could not be preserved")
                 self.cancellation.raise_if_cancelled()
-                if target_dimensions is not None:
-                    img = img.resize(
-                        (target_dimensions.width, target_dimensions.height),
-                        resample=Image.Resampling.LANCZOS,
-                    )
-                    out_dims = target_dimensions
-                elif scale_factor < 0.999:
-                    new_w = max(2, int(img.width * scale_factor) // 2 * 2)
-                    new_h = max(2, int(img.height * scale_factor) // 2 * 2)
-                    img = img.resize((new_w, new_h), resample=Image.Resampling.LANCZOS)
-                    out_dims = ImageDimensions(new_w, new_h)
-                else:
-                    out_dims = ImageDimensions(img.width, img.height)
+                out_dims = ImageDimensions(img.width, img.height)
+                if target_dimensions is not None and out_dims != target_dimensions:
+                    raise EncodeError("prepared image dimensions do not match the expected canvas")
 
                 destination.parent.mkdir(parents=True, exist_ok=True)
-                if codec == ImageCodec.PNG:
-                    colors = quality_to_png_colors(quality)
-                    if colors is not None:
-                        if self._is_high_bit_depth_mode(img.mode):
-                            raise EncodeError(
-                                "Palette PNG conversion would reduce source bit depth"
-                            )
-                        img = self._quantize_png(img, colors)
+                if codec == ImageCodec.PNG and png_colors is not None:
+                    if self._is_high_bit_depth_mode(img.mode) or (source_bit_depth or 0) > 8:
+                        raise EncodeError(
+                            "Palette PNG conversion would reduce source bit depth"
+                        )
+                    img = self._quantize_png(img, png_colors)
                 save_kwargs = self._save_kwargs(
                     codec,
                     quality,
@@ -2128,6 +3705,8 @@ class PillowEncoder(Encoder):
                     strip_metadata,
                     source_exif,
                     source_pixel_format=source_pixel_format,
+                    webp_variant=webp_variant,
+                    webp_method=webp_method,
                 )
                 if preserve_icc_profile and icc_profile:
                     save_kwargs["icc_profile"] = icc_profile
@@ -2157,6 +3736,8 @@ class PillowEncoder(Encoder):
                 error=str(exc)[:600],
                 dimensions=out_dims,
                 output_path=None,
+                webp_method=webp_method if codec == ImageCodec.WEBP else None,
+                png_colors=png_colors,
             )
 
         elapsed = time.perf_counter() - t0
@@ -2172,6 +3753,17 @@ class PillowEncoder(Encoder):
             error=None if out_size > 0 else "zero_byte_output",
             dimensions=out_dims,
             output_path=destination if out_size > 0 else None,
+            variant=(
+                f"{webp_variant.value}-method-{webp_method}"
+                if codec == ImageCodec.WEBP
+                else "progressive"
+                if codec == ImageCodec.JPG and progressive
+                else "baseline"
+                if codec == ImageCodec.JPG
+                else None
+            ),
+            webp_method=webp_method if codec == ImageCodec.WEBP else None,
+            png_colors=png_colors,
         )
 
     @staticmethod
@@ -2240,6 +3832,8 @@ class PillowEncoder(Encoder):
         source_exif: Any,
         *,
         source_pixel_format: Optional[str] = None,
+        webp_variant: WebPVariant = WebPVariant.LOSSY,
+        webp_method: int = WEBP_SEARCH_METHOD,
     ) -> Dict[str, Any]:
         if codec == ImageCodec.JPG:
             kwargs: Dict[str, Any] = {
@@ -2255,14 +3849,17 @@ class PillowEncoder(Encoder):
             kwargs = {
                 "format": "PNG",
                 "optimize": True,
-                "compress_level": quality_to_png_level(quality),
+                "compress_level": PNG_COMPRESS_LEVEL,
             }
         else:
-            webp_q, lossless = quality_to_webp_params(quality)
+            webp_q, lossless = quality_to_webp_params(
+                quality,
+                webp_variant,
+            )
             kwargs = {
                 "format": "WEBP",
                 "quality": webp_q,
-                "method": 6,
+                "method": webp_method,
                 "lossless": lossless,
             }
         if (
@@ -2315,13 +3912,11 @@ class DualEncoder:
         self,
         ffmpeg_encoder: FFmpegEncoder,
         pillow_encoder: Optional[PillowEncoder],
-        logger: logging.Logger,
         *,
         prefer: EncodeBackend = EncodeBackend.FFMPEG,
     ) -> None:
         self.ffmpeg_encoder = ffmpeg_encoder
         self.pillow_encoder = pillow_encoder
-        self.logger = logger
         self.prefer = prefer
 
     def encode_image(
@@ -2341,32 +3936,32 @@ class DualEncoder:
         source_has_icc_profile: Optional[bool] = None,
         source_bit_depth: Optional[int] = None,
         source_has_alpha: bool = False,
+        webp_variant: WebPVariant = WebPVariant.LOSSY,
+        webp_method: int = WEBP_SEARCH_METHOD,
+        png_colors: Optional[int] = None,
     ) -> CompressionAttempt:
-        order: List[Encoder] = []
+        order: List[Union[FFmpegEncoder, PillowEncoder]] = []
         if (
             source_has_icc_profile is None
             and preserve_icc_profile
         ):
             source_has_icc_profile = self._source_has_icc(source)
-        requires_pillow = (
+        strict_pillow_required = (
             not strip_metadata
-            or source_orientation not in (0, 1)
             or (
                 preserve_icc_profile
-                and PILLOW_AVAILABLE
                 and source_has_icc_profile
             )
             or (codec == ImageCodec.JPG and source_has_alpha)
         )
-        palette_png = (
-            codec == ImageCodec.PNG
-            and quality_to_png_colors(quality) is not None
-        )
+        prefer_pillow = strict_pillow_required or (
+            progressive and codec == ImageCodec.JPG
+        ) or source_orientation not in (0, 1)
+        palette_png = codec == ImageCodec.PNG and png_colors is not None
         pillow_required_without_pillow = (
             self.pillow_encoder is None
             and (
                 not strip_metadata
-                or source_orientation not in (0, 1)
                 or (
                     preserve_icc_profile
                     and bool(source_has_icc_profile)
@@ -2378,8 +3973,6 @@ class DualEncoder:
             requirements: List[str] = []
             if not strip_metadata:
                 requirements.append("preserve image metadata")
-            if source_orientation not in (0, 1):
-                requirements.append("normalize EXIF orientation safely")
             if preserve_icc_profile and source_has_icc_profile:
                 requirements.append("preserve the ICC profile")
             if codec == ImageCodec.JPG and source_has_alpha:
@@ -2398,6 +3991,7 @@ class DualEncoder:
                 ),
                 dimensions=target_dimensions,
                 output_path=None,
+                png_colors=png_colors,
             )
         if palette_png and self.pillow_encoder is None:
             return CompressionAttempt(
@@ -2411,6 +4005,7 @@ class DualEncoder:
                 error="Pillow 10.0+ is required for palette PNG output",
                 dimensions=target_dimensions,
                 output_path=None,
+                png_colors=png_colors,
             )
         high_bit_depth_png = (
             codec == ImageCodec.PNG
@@ -2439,9 +4034,11 @@ class DualEncoder:
         if high_bit_depth_png:
             order = [self.ffmpeg_encoder]
         else:
-            pillow_first = codec == ImageCodec.PNG or requires_pillow
-            if self.pillow_encoder and (requires_pillow or palette_png):
+            pillow_first = codec == ImageCodec.PNG or prefer_pillow
+            if self.pillow_encoder and (strict_pillow_required or palette_png):
                 order = [self.pillow_encoder]
+            elif self.pillow_encoder and progressive and codec == ImageCodec.JPG:
+                order = [self.pillow_encoder, self.ffmpeg_encoder]
             elif self.pillow_encoder and (
                 self.prefer == EncodeBackend.PILLOW or pillow_first
             ):
@@ -2452,6 +4049,7 @@ class DualEncoder:
                     order.append(self.pillow_encoder)
 
         last: Optional[CompressionAttempt] = None
+        transient_failure = False
         for enc in order:
             tmp = unique_temp_path(destination.parent, destination.suffix, label=enc.name)
             try:
@@ -2461,22 +4059,25 @@ class DualEncoder:
                 pass
 
             try:
-                attempt = enc.encode_image(
-                    source,
-                    tmp,
-                    codec=codec,
-                    quality=quality,
-                    scale_factor=scale_factor,
-                    target_dimensions=target_dimensions,
-                    strip_metadata=strip_metadata,
-                    preserve_icc_profile=preserve_icc_profile,
-                    progressive=progressive,
-                    source_pixel_format=source_pixel_format,
-                    source_orientation=source_orientation,
-                    source_has_icc_profile=source_has_icc_profile,
-                    source_bit_depth=source_bit_depth,
-                    source_has_alpha=source_has_alpha,
-                )
+                encode_kwargs: Dict[str, Any] = {
+                    "codec": codec,
+                    "quality": quality,
+                    "scale_factor": scale_factor,
+                    "target_dimensions": target_dimensions,
+                    "strip_metadata": strip_metadata,
+                    "preserve_icc_profile": preserve_icc_profile,
+                    "progressive": progressive,
+                    "source_pixel_format": source_pixel_format,
+                    "source_has_icc_profile": source_has_icc_profile,
+                    "source_has_alpha": source_has_alpha,
+                    "webp_variant": webp_variant,
+                    "webp_method": webp_method,
+                    "png_colors": png_colors,
+                }
+                if isinstance(enc, PillowEncoder):
+                    encode_kwargs["source_orientation"] = source_orientation
+                    encode_kwargs["source_bit_depth"] = source_bit_depth
+                attempt = enc.encode_image(source, tmp, **encode_kwargs)
             except UserAbortError:
                 try:
                     tmp.unlink(missing_ok=True)
@@ -2496,40 +4097,46 @@ class DualEncoder:
                         tmp.unlink(missing_ok=True)
                     except OSError:
                         pass
-                    continue
+                    return attempt
                 attempt.output_bytes = file_size(destination)
                 attempt.output_path = destination
                 return attempt
 
+            transient_failure = (
+                transient_failure or attempt.transient_failure
+            )
             try:
                 if tmp.exists():
                     tmp.unlink()
             except OSError:
                 pass
-            self.logger.debug("Encoder %s failed for %s: %s", enc.name, source.name, attempt.error)
-
-        assert last is not None
+        if last is None:
+            raise EncodeError("no compatible encoder is available")
+        last.transient_failure = transient_failure
         return last
 
     @staticmethod
     def _source_has_icc(source: Path) -> bool:
-        if not PILLOW_AVAILABLE or Image is None:
-            return False
-        try:
-            with Image.open(source) as img:
-                return bool(img.info.get("icc_profile"))
-        except UserAbortError:
-            raise
-        except Exception:
-            return False
+        return container_has_icc_profile(source)
+
+    def release_source(self, source: Path) -> None:
+        if self.pillow_encoder is not None:
+            self.pillow_encoder.release_source(source)
 
 
 class StrategyEngine:
 
-    def __init__(self, encoder: DualEncoder, logger: logging.Logger, config: RuntimeConfig) -> None:
+    def __init__(
+        self,
+        encoder: DualEncoder,
+        logger: logging.Logger,
+        config: RuntimeConfig,
+        verifier: OutputVerifier,
+    ) -> None:
         self.encoder = encoder
         self.logger = logger
         self.config = config
+        self.verifier = verifier
 
     def _codec_for(self, path: Path) -> ImageCodec:
         return resolve_output_codec(path, self.config.output_format)
@@ -2539,15 +4146,18 @@ class StrategyEngine:
 
     def _encode(
         self,
-        source: Path,
+        probe: ImageProbeResult,
         destination: Path,
         *,
         quality: int,
         scale_factor: float = 1.0,
         target_dimensions: Optional[ImageDimensions] = None,
-        source_probe: Optional[ImageProbeResult] = None,
+        webp_variant: WebPVariant = WebPVariant.LOSSY,
+        webp_method: int = WEBP_SEARCH_METHOD,
+        png_colors: Optional[int] = None,
     ) -> CompressionAttempt:
-        codec = self._codec_for(source)
+        source = probe.processing_path or probe.path
+        codec = self._codec_for(probe.path)
         encode_kwargs: Dict[str, Any] = {
             "codec": codec,
             "quality": quality,
@@ -2556,15 +4166,17 @@ class StrategyEngine:
             "strip_metadata": self.config.strip_metadata,
             "preserve_icc_profile": self.config.preserve_icc_profile,
             "progressive": self.config.progressive_jpeg,
+            "webp_variant": webp_variant,
+            "webp_method": webp_method,
+            "png_colors": png_colors,
         }
-        if source_probe is not None:
-            encode_kwargs.update(
-                source_pixel_format=source_probe.pixel_format,
-                source_orientation=source_probe.exif_orientation,
-                source_has_icc_profile=source_probe.has_icc_profile,
-                source_bit_depth=source_probe.bit_depth,
-                source_has_alpha=source_probe.has_alpha,
-            )
+        encode_kwargs.update(
+            source_pixel_format=probe.pixel_format,
+            source_orientation=probe.exif_orientation,
+            source_has_icc_profile=probe.has_icc_profile,
+            source_bit_depth=probe.bit_depth,
+            source_has_alpha=probe.has_alpha,
+        )
         return self.encoder.encode_image(
             source,
             destination,
@@ -2582,8 +4194,15 @@ class StrategyEngine:
             status=ImageStatus.PENDING,
             original_bytes=probe.size_bytes,
             original_dimensions=probe.dimensions,
-            strategy_used=self.config.strategy,
+            target_codec=self._codec_for(source),
+            source_has_alpha=probe.has_alpha,
+            source_has_icc_profile=probe.has_icc_profile,
+            source_icc_profile_sha256=probe.icc_profile_sha256,
+            resized=probe.resized,
+            padded=probe.padded,
+            scale_factor=probe.canvas_scale,
         )
+        process_termination_unconfirmed = False
         try:
             if not probe.is_readable:
                 result.status = ImageStatus.SKIPPED_CORRUPT
@@ -2594,7 +4213,10 @@ class StrategyEngine:
             target_codec = self._codec_for(source)
             same_format = codecs_match_for_copy(source, target_codec)
 
-            if self.config.size_policy.is_acceptable(probe.size_bytes):
+            if (
+                probe.processing_path is None
+                and self.config.size_policy.is_acceptable(probe.size_bytes)
+            ):
                 if same_format:
                     handled = self._handle_under_limit(
                         probe,
@@ -2650,6 +4272,9 @@ class StrategyEngine:
             return result
         except UserAbortError:
             raise
+        except ProcessTerminationError:
+            process_termination_unconfirmed = True
+            raise
         except Exception as exc:
             self.logger.exception("Unhandled error processing %s", source.name)
             result.status = ImageStatus.FAILED
@@ -2657,7 +4282,9 @@ class StrategyEngine:
             result.error_detail = f"{type(exc).__name__}: {exc}"
             return result
         finally:
-            self._cleanup_uncommitted_attempts(result)
+            self.encoder.release_source(probe.processing_path or probe.path)
+            if not process_termination_unconfirmed:
+                self._cleanup_uncommitted_attempts(result)
             result.elapsed_sec = time.perf_counter() - t0
 
     def _try_format_convert_only(
@@ -2667,17 +4294,16 @@ class StrategyEngine:
         work_dir: Path,
         result: ImageJobResult,
     ) -> bool:
-        tmp = unique_temp_path(work_dir, suffix=self._temp_suffix(probe.path))
-        attempt = self._encode(
-            probe.path,
-            tmp,
+        attempt = self._attempt_candidate(
+            probe,
+            work_dir,
+            result,
             quality=QUALITY_LOSSLESS_PROXY,
             scale_factor=1.0,
-            source_probe=probe,
+            label="format-convert",
         )
-        result.attempts.append(attempt)
-        if attempt.success and attempt.is_preferred(self.config.size_policy):
-            self._commit_best(attempt, final_dest, result, quality=QUALITY_LOSSLESS_PROXY)
+        if attempt and attempt.is_preferred(self.config.size_policy):
+            self._commit_best(probe, work_dir, attempt, final_dest, result)
             return result.status == ImageStatus.COMPRESSED
         self._discard_attempt(attempt)
         return False
@@ -2703,68 +4329,104 @@ class StrategyEngine:
         stage: Optional[Path] = None
         try:
             self.config.cancellation.raise_if_cancelled()
-            if self.config.strip_metadata:
-                tmp = unique_temp_path(work_dir, self._temp_suffix(probe.path), label="sanitize")
-                attempt = self._encode(
+            stage = unique_temp_path(
+                work_dir,
+                self._temp_suffix(probe.path),
+                label="sanitize" if self.config.strip_metadata else "copy",
+            )
+            sanitized = False
+            fallback_reason: Optional[str] = None
+            metadata_retained = False
+            if self.config.strip_metadata and probe.is_jpeg:
+                sanitized_result = JPEGMetadataSanitizer.sanitize(
                     probe.path,
-                    tmp,
-                    quality=QUALITY_LOSSLESS_PROXY,
-                    scale_factor=1.0,
-                    source_probe=probe,
+                    stage,
+                    orientation=probe.exif_orientation,
+                    preserve_icc=self.config.preserve_icc_profile,
                 )
-                result.attempts.append(attempt)
-                if not attempt.success:
-                    result.status = ImageStatus.FAILED
-                    result.message = "metadata_sanitize_failed"
-                    result.error_detail = attempt.error
-                    self._discard_attempt(attempt)
-                    result.elapsed_sec = time.perf_counter() - t0
-                    return result
-                if not self.config.size_policy.is_acceptable(attempt.output_bytes):
-                    self._discard_attempt(attempt)
-                    return None
-                self._commit_best(attempt, final_dest, result)
-                if result.status == ImageStatus.COMPRESSED:
-                    result.status = ImageStatus.SANITIZED
-                    result.message = t("msg_already_copied")
+                icc_preserved = (
+                    not self.config.preserve_icc_profile
+                    or not probe.has_icc_profile
+                    or sanitized_result.preserved_icc
+                )
+                sanitized = (
+                    sanitized_result.success
+                    and sanitized_result.changed
+                    and icc_preserved
+                )
+                if not sanitized_result.success or not icc_preserved:
+                    fallback_reason = (
+                        sanitized_result.error
+                        or "ICC profile could not be safely preserved during sanitization"
+                    )
+                    metadata_retained = True
+                    shutil.copy2(probe.path, stage)
             else:
-                stage = unique_temp_path(final_dest.parent, final_dest.suffix, label="copy")
-                shutil.copy2(probe.path, stage)
-                self.config.cancellation.run_if_active(
-                    lambda: atomic_publish(
-                        stage,
-                        final_dest,
-                        overwrite=self.config.overwrite_output,
-                    )
+                metadata_retained = (
+                    self.config.strip_metadata and not probe.is_jpeg
                 )
-                stage = None
-                fsync_directory(final_dest.parent)
-                result.output_path = final_dest
-                result.output_bytes = file_size(final_dest)
-                if not self.config.size_policy.is_acceptable(
-                    result.output_bytes
-                ):
-                    try:
-                        final_dest.unlink(missing_ok=True)
-                    except OSError:
-                        pass
-                    result.output_path = None
-                    raise WorkspaceError(
-                        "published copy violates the strict size limit"
-                    )
-                result.output_dimensions = probe.dimensions
+                shutil.copy2(probe.path, stage)
+            attempt = CompressionAttempt(
+                backend=EncodeBackend.COPY,
+                quality=None,
+                ffmpeg_q=None,
+                scale_factor=1.0,
+                output_bytes=file_size(stage),
+                elapsed_sec=0.0,
+                success=stage.is_file() and file_size(stage) > 0,
+                dimensions=probe.dimensions,
+                output_path=stage,
+                variant=(
+                    "marker-sanitized"
+                    if sanitized
+                    else "exact-copy-metadata-retained"
+                    if metadata_retained
+                    else "exact-copy"
+                ),
+                error=fallback_reason,
+            )
+            result.attempts.append(attempt)
+            if not attempt.success:
+                result.status = ImageStatus.FAILED
+                result.message = "copy_failed"
+                result.error_detail = attempt.error
+                self._discard_attempt(attempt)
+                return result
+            if not self.config.size_policy.is_acceptable(attempt.output_bytes):
+                self._discard_attempt(attempt)
+                return None
+            self._commit_best(probe, work_dir, attempt, final_dest, result)
+            stage = None
+            if result.status == ImageStatus.COMPRESSED:
                 result.backend = EncodeBackend.COPY
-                result.status = ImageStatus.COPIED
-                result.message = t("msg_already_copied")
-        except UserAbortError:
+                result.quality_used = None
+                result.ffmpeg_q_used = None
+                result.variant = attempt.variant
+                if sanitized:
+                    result.status = ImageStatus.SANITIZED
+                    result.message = "metadata removed without image re-encoding"
+                else:
+                    result.status = ImageStatus.COPIED
+                    result.message = (
+                        "exact copy; metadata retained because safe sanitization was not possible"
+                        if fallback_reason
+                        else "exact copy; metadata retained"
+                        if metadata_retained
+                        else t("msg_already_copied")
+                    )
+                    result.error_detail = (
+                        fallback_reason
+                        or (
+                            "metadata stripping is best effort for exact PNG/WEBP copies"
+                            if metadata_retained
+                            else None
+                        )
+                    )
+        except (UserAbortError, ProcessTerminationError):
             raise
         except Exception as exc:
             result.status = ImageStatus.FAILED
-            result.message = (
-                "metadata_sanitize_failed"
-                if self.config.strip_metadata
-                else "copy_failed"
-            )
+            result.message = "metadata_sanitize_failed" if self.config.strip_metadata else "copy_failed"
             result.error_detail = f"{type(exc).__name__}: {exc}"
         finally:
             if stage is not None:
@@ -2778,57 +4440,109 @@ class StrategyEngine:
     def _strategy_png(
         self, probe: ImageProbeResult, final_dest: Path, work_dir: Path, result: ImageJobResult
     ) -> None:
-        qualities: Sequence[int] = (QUALITY_LOSSLESS_PROXY,)
         palette_supported = (
             self.encoder.pillow_encoder is not None
             and not self._probe_is_high_bit_depth(probe)
         )
-        if (
-            palette_supported
-            and self.config.strategy == CompressionStrategy.LOSSLESS_FIRST
-        ):
-            qualities = (
-                QUALITY_LOSSLESS_PROXY,
-                PNG_PALETTE_QUALITIES[0],
-            )
-        elif (
-            palette_supported
-            and self.config.strategy
-            != CompressionStrategy.COPY_ONLY_UNDER_LIMIT
-        ):
-            qualities = (QUALITY_LOSSLESS_PROXY, *PNG_PALETTE_QUALITIES)
-        best: Optional[CompressionAttempt] = None
-        for quality in qualities:
-            self.config.cancellation.raise_if_cancelled()
-            tmp = unique_temp_path(work_dir, ".png", label="png")
-            attempt = self._encode(
-                probe.path,
-                tmp,
-                quality=quality,
-                scale_factor=1.0,
-                source_probe=probe,
-            )
-            attempt.variant = (
-                "lossless"
-                if quality == QUALITY_LOSSLESS_PROXY
-                else f"palette-{quality_to_png_colors(quality)}"
-            )
-            result.attempts.append(attempt)
-            if not attempt.success:
-                self._discard_attempt(attempt)
-                continue
-            selected = self._better_attempt(best, attempt)
-            if selected is attempt:
-                self._discard_attempt(best)
-                best = attempt
-            else:
-                self._discard_attempt(attempt)
-            if best and best.is_preferred(self.config.size_policy):
-                break
+        best = self._attempt_candidate(
+            probe,
+            work_dir,
+            result,
+            quality=QUALITY_LOSSLESS_PROXY,
+            label="png-lossless",
+        )
+        if best is not None:
+            best.variant = "lossless"
         if best and best.is_preferred(self.config.size_policy):
-            self._commit_best(best, final_dest, result)
+            self._commit_best(probe, work_dir, best, final_dest, result)
             return
-        self._fail_or_commit_closest(best, final_dest, result)
+        if palette_supported:
+            best = self._phase_png_palette_search(
+                probe,
+                work_dir,
+                result,
+                previous_best=best,
+            )
+        self._fail_or_commit_closest(probe, work_dir, best, final_dest, result)
+
+    def _phase_png_palette_search(
+        self,
+        probe: ImageProbeResult,
+        work_dir: Path,
+        result: ImageJobResult,
+        *,
+        previous_best: Optional[CompressionAttempt] = None,
+    ) -> Optional[CompressionAttempt]:
+        best = previous_best
+        tried: set[int] = set()
+        for colors in PNG_PALETTE_COLOR_TARGETS:
+            tried.add(colors)
+            attempt = self._attempt_candidate(
+                probe,
+                work_dir,
+                result,
+                quality=png_palette_quality(colors),
+                png_colors=colors,
+                label="png-palette",
+            )
+            if attempt is None:
+                continue
+            attempt.variant = f"palette-{colors}"
+            best = self._retain_better(best, attempt)
+            if best.is_preferred(self.config.size_policy):
+                break
+        lo = PNG_PALETTE_MIN_COLORS
+        hi = 256
+        iterations = 0
+        while lo <= hi and iterations < BINARY_SEARCH_MAX_ITERS:
+            self.config.cancellation.raise_if_cancelled()
+            iterations += 1
+            colors = (lo + hi) // 2
+            if colors in tried:
+                available = [
+                    value
+                    for value in range(lo, hi + 1)
+                    if value not in tried
+                ]
+                if not available:
+                    break
+                colors = available[len(available) // 2]
+            tried.add(colors)
+            attempt = self._attempt_candidate(
+                probe,
+                work_dir,
+                result,
+                quality=png_palette_quality(colors),
+                png_colors=colors,
+                label="png-palette-search",
+            )
+            if attempt is None:
+                hi = colors - 1
+                continue
+            attempt.variant = f"palette-{colors}"
+            best = self._retain_better(best, attempt)
+            if attempt.is_preferred(self.config.size_policy):
+                lo = colors + 1
+            else:
+                hi = colors - 1
+        boundary = best.png_colors if best and best.png_colors is not None else None
+        if boundary is not None:
+            for colors in range(max(2, boundary - 3), min(256, boundary + 3) + 1):
+                if colors in tried:
+                    continue
+                attempt = self._attempt_candidate(
+                    probe,
+                    work_dir,
+                    result,
+                    quality=png_palette_quality(colors),
+                    png_colors=colors,
+                    label="png-palette-refine",
+                )
+                if attempt is None:
+                    continue
+                attempt.variant = f"palette-{colors}"
+                best = self._retain_better(best, attempt)
+        return best
 
     @staticmethod
     def _probe_is_high_bit_depth(probe: ImageProbeResult) -> bool:
@@ -2842,9 +4556,9 @@ class StrategyEngine:
     def _strategy_lossless_first(
         self, probe: ImageProbeResult, final_dest: Path, work_dir: Path, result: ImageJobResult
     ) -> None:
-        best = self._phase_near_lossless(probe, work_dir, result)
+        best = self._phase_maximum_fidelity(probe, work_dir, result)
         if best and best.is_preferred(self.config.size_policy):
-            self._commit_best(best, final_dest, result, quality=QUALITY_LOSSLESS_PROXY)
+            self._commit_best(probe, work_dir, best, final_dest, result)
             return
         best = self._phase_quality_ladder(
             probe,
@@ -2855,120 +4569,472 @@ class StrategyEngine:
             previous_best=best,
         )
         if best and best.is_preferred(self.config.size_policy):
-            self._commit_best(best, final_dest, result)
+            self._commit_best(probe, work_dir, best, final_dest, result)
             return
-        if self.config.allow_downscale:
-            best = self._phase_downscale_search(probe, work_dir, result, previous_best=best)
-            if best and best.is_preferred(self.config.size_policy):
-                self._commit_best(best, final_dest, result)
-                return
-        self._fail_or_commit_closest(best, final_dest, result)
+        q_lo, q_hi = self._predictive_quality_bounds(probe)
+        best = self._phase_binary_search(
+            probe,
+            work_dir,
+            result,
+            q_lo=q_lo,
+            q_hi=min(84, q_hi),
+            scale_factor=1.0,
+            previous_best=best,
+        )
+        if best and best.is_preferred(self.config.size_policy):
+            self._commit_best(probe, work_dir, best, final_dest, result)
+            return
+        if best and best.is_acceptable(self.config.size_policy):
+            self._commit_best(probe, work_dir, best, final_dest, result)
+            return
+        self._fail_or_commit_closest(probe, work_dir, best, final_dest, result)
 
     def _strategy_high_quality(
         self, probe: ImageProbeResult, final_dest: Path, work_dir: Path, result: ImageJobResult
     ) -> None:
+        q_lo, q_hi = self._predictive_quality_bounds(probe)
+        ladder = tuple(q for q in (95, 93, 92, 90, 88, 85) if q <= q_hi)
         best = self._phase_quality_ladder(
-            probe, work_dir, result, qualities=(95, 93, 92, 90), scale_factor=1.0
+            probe,
+            work_dir,
+            result,
+            qualities=ladder or (q_hi,),
+            scale_factor=1.0,
         )
         if best and best.is_preferred(self.config.size_policy):
-            self._commit_best(best, final_dest, result)
+            self._commit_best(probe, work_dir, best, final_dest, result)
             return
         best = self._phase_binary_search(
             probe,
             work_dir,
             result,
-            q_lo=QUALITY_BINARY_MIN,
-            q_hi=89,
+            q_lo=q_lo,
+            q_hi=min(89, q_hi),
             scale_factor=1.0,
             previous_best=best,
         )
         if best and best.is_preferred(self.config.size_policy):
-            self._commit_best(best, final_dest, result)
+            self._commit_best(probe, work_dir, best, final_dest, result)
             return
-        if self.config.allow_downscale:
-            best = self._phase_downscale_search(probe, work_dir, result, previous_best=best)
-            if best and best.is_preferred(self.config.size_policy):
-                self._commit_best(best, final_dest, result)
-                return
-        self._fail_or_commit_closest(best, final_dest, result)
+        if best and best.is_acceptable(self.config.size_policy):
+            self._commit_best(probe, work_dir, best, final_dest, result)
+            return
+        self._fail_or_commit_closest(probe, work_dir, best, final_dest, result)
 
     def _strategy_binary_search(
         self, probe: ImageProbeResult, final_dest: Path, work_dir: Path, result: ImageJobResult
     ) -> None:
+        q_lo, q_hi = self._predictive_quality_bounds(probe)
         best = self._phase_binary_search(
             probe,
             work_dir,
             result,
-            q_lo=QUALITY_BINARY_MIN,
-            q_hi=QUALITY_BINARY_MAX,
+            q_lo=q_lo,
+            q_hi=q_hi,
             scale_factor=1.0,
         )
         if best and best.is_preferred(self.config.size_policy):
-            self._commit_best(best, final_dest, result)
+            self._commit_best(probe, work_dir, best, final_dest, result)
             return
-        if self.config.allow_downscale:
-            best = self._phase_downscale_search(probe, work_dir, result, previous_best=best)
-            if best and best.is_preferred(self.config.size_policy):
-                self._commit_best(best, final_dest, result)
-                return
-        self._fail_or_commit_closest(best, final_dest, result)
+        if best and best.is_acceptable(self.config.size_policy):
+            self._commit_best(probe, work_dir, best, final_dest, result)
+            return
+        self._fail_or_commit_closest(probe, work_dir, best, final_dest, result)
 
     def _strategy_aggressive_adaptive(
         self, probe: ImageProbeResult, final_dest: Path, work_dir: Path, result: ImageJobResult
     ) -> None:
-        best = self._phase_near_lossless(probe, work_dir, result)
-        if best and best.is_preferred(self.config.size_policy):
-            self._commit_best(best, final_dest, result, quality=QUALITY_LOSSLESS_PROXY)
-            return
-        best = self._phase_quality_ladder(
-            probe, work_dir, result, qualities=(95, 92, 90), scale_factor=1.0, previous_best=best
+        reduction_needed = probe.reduction_needed_pct(self.config.size_policy)
+        best = (
+            self._phase_maximum_fidelity(probe, work_dir, result)
+            if reduction_needed < 20.0
+            else None
         )
         if best and best.is_preferred(self.config.size_policy):
-            self._commit_best(best, final_dest, result)
+            self._commit_best(probe, work_dir, best, final_dest, result)
+            return
+        q_lo, q_hi = self._predictive_quality_bounds(probe)
+        ladder = tuple(q for q in (95, 92, 90, 86, 82, 78) if q <= q_hi)
+        best = self._phase_quality_ladder(
+            probe,
+            work_dir,
+            result,
+            qualities=ladder or (q_hi,),
+            scale_factor=1.0,
+            previous_best=best,
+        )
+        if best and best.is_preferred(self.config.size_policy):
+            self._commit_best(probe, work_dir, best, final_dest, result)
             return
         best = self._phase_binary_search(
             probe,
             work_dir,
             result,
-            q_lo=QUALITY_BINARY_MIN,
-            q_hi=89,
+            q_lo=q_lo,
+            q_hi=min(89, q_hi),
             scale_factor=1.0,
             previous_best=best,
         )
         if best and best.is_preferred(self.config.size_policy):
-            self._commit_best(best, final_dest, result)
+            self._commit_best(probe, work_dir, best, final_dest, result)
             return
-        if self.config.allow_downscale:
-            best = self._phase_downscale_search(probe, work_dir, result, previous_best=best)
-            if best and best.is_preferred(self.config.size_policy):
-                self._commit_best(best, final_dest, result)
-                return
-        self._fail_or_commit_closest(best, final_dest, result)
+        if best and best.is_acceptable(self.config.size_policy):
+            self._commit_best(probe, work_dir, best, final_dest, result)
+            return
+        self._fail_or_commit_closest(probe, work_dir, best, final_dest, result)
 
-    def _phase_near_lossless(
-        self, probe: ImageProbeResult, work_dir: Path, result: ImageJobResult
+    def _predictive_quality_bounds(
+        self,
+        probe: ImageProbeResult,
+    ) -> Tuple[int, int]:
+        reduction_needed = probe.reduction_needed_pct(self.config.size_policy)
+        if reduction_needed >= 55.0:
+            return (20, 74)
+        if reduction_needed >= 40.0:
+            return (24, 82)
+        if reduction_needed >= 25.0:
+            return (30, 88)
+        if reduction_needed >= 10.0:
+            return (36, 93)
+        return (QUALITY_BINARY_MIN, QUALITY_BINARY_MAX)
+
+    def _attempt_key(
+        self,
+        probe: ImageProbeResult,
+        *,
+        quality: int,
+        scale_factor: float,
+        target_dimensions: Optional[ImageDimensions],
+        webp_variant: WebPVariant,
+        webp_method: int,
+        png_colors: Optional[int],
+    ) -> Tuple[Any, ...]:
+        dimensions = target_dimensions or probe.processing_dimensions or probe.dimensions
+        codec = self._codec_for(probe.path)
+        backend = self._preferred_backend_for_attempt(
+            probe,
+            codec,
+            png_colors,
+        )
+        if codec == ImageCodec.PNG:
+            effective_quality: Any = (
+                ("palette", png_colors)
+                if png_colors is not None
+                else ("lossless", PNG_COMPRESS_LEVEL)
+            )
+        elif codec == ImageCodec.WEBP and webp_variant == WebPVariant.LOSSLESS:
+            effective_quality = ("lossless", webp_method)
+        else:
+            effective_quality = ("request", quality)
+        return self._attempt_key_parts(
+            probe,
+            backend=backend,
+            effective_quality=effective_quality,
+            scale_factor=scale_factor,
+            dimensions=dimensions,
+            webp_variant=webp_variant,
+            webp_method=webp_method,
+        )
+
+    def _attempt_key_parts(
+        self,
+        probe: ImageProbeResult,
+        *,
+        backend: EncodeBackend,
+        effective_quality: Any,
+        scale_factor: float,
+        dimensions: Optional[ImageDimensions],
+        webp_variant: WebPVariant,
+        webp_method: int,
+    ) -> Tuple[Any, ...]:
+        jpeg_mode = (
+            "progressive"
+            if self._codec_for(probe.path) == ImageCodec.JPG
+            and backend == EncodeBackend.PILLOW
+            and self.config.progressive_jpeg
+            else "baseline"
+        )
+        return (
+            self._codec_for(probe.path),
+            webp_variant,
+            webp_method,
+            backend,
+            effective_quality,
+            dimensions.width if dimensions else None,
+            dimensions.height if dimensions else None,
+            round(scale_factor, 8),
+            self.config.strip_metadata,
+            self.config.preserve_icc_profile,
+            jpeg_mode,
+            probe.has_alpha,
+            probe.has_icc_profile,
+            probe.resized,
+            probe.padded,
+            self.config.allow_upscale,
+        )
+
+    def _successful_attempt_alias(
+        self,
+        probe: ImageProbeResult,
+        attempt: CompressionAttempt,
+        *,
+        scale_factor: float,
+        target_dimensions: Optional[ImageDimensions],
+        webp_variant: WebPVariant,
+        webp_method: int,
+    ) -> Optional[Tuple[Any, ...]]:
+        if (
+            self._codec_for(probe.path) != ImageCodec.JPG
+            or not attempt.success
+            or attempt.output_path is None
+            or attempt.backend != EncodeBackend.FFMPEG
+            or attempt.ffmpeg_q is None
+        ):
+            return None
+        return self._attempt_key_parts(
+            probe,
+            backend=EncodeBackend.FFMPEG,
+            effective_quality=("ffmpeg-q", attempt.ffmpeg_q),
+            scale_factor=scale_factor,
+            dimensions=target_dimensions or probe.processing_dimensions or probe.dimensions,
+            webp_variant=webp_variant,
+            webp_method=webp_method,
+        )
+
+    def _predicted_attempt_alias(
+        self,
+        probe: ImageProbeResult,
+        *,
+        quality: int,
+        scale_factor: float,
+        target_dimensions: Optional[ImageDimensions],
+        webp_variant: WebPVariant,
+        webp_method: int,
+    ) -> Optional[Tuple[Any, ...]]:
+        codec = self._codec_for(probe.path)
+        backend = self._preferred_backend_for_attempt(
+            probe,
+            codec,
+            None,
+        )
+        if codec != ImageCodec.JPG or backend != EncodeBackend.FFMPEG:
+            return None
+        return self._attempt_key_parts(
+            probe,
+            backend=EncodeBackend.FFMPEG,
+            effective_quality=("ffmpeg-q", quality_to_ffmpeg_q(quality)),
+            scale_factor=scale_factor,
+            dimensions=target_dimensions or probe.processing_dimensions or probe.dimensions,
+            webp_variant=webp_variant,
+            webp_method=webp_method,
+        )
+
+    def _preferred_backend_for_attempt(
+        self,
+        probe: ImageProbeResult,
+        codec: ImageCodec,
+        png_colors: Optional[int],
+    ) -> EncodeBackend:
+        pillow = getattr(self.encoder, "pillow_encoder", None)
+        if pillow is None:
+            return EncodeBackend.FFMPEG
+        high_bit_depth_png = (
+            codec == ImageCodec.PNG
+            and self._probe_is_high_bit_depth(probe)
+        )
+        if high_bit_depth_png:
+            return EncodeBackend.FFMPEG
+        requires_pillow = (
+            not self.config.strip_metadata
+            or probe.exif_orientation not in (0, 1)
+            or (
+                self.config.progressive_jpeg
+                and codec == ImageCodec.JPG
+            )
+            or (
+                self.config.preserve_icc_profile
+                and PILLOW_AVAILABLE
+                and probe.has_icc_profile
+            )
+            or (codec == ImageCodec.JPG and probe.has_alpha)
+        )
+        palette_png = codec == ImageCodec.PNG and png_colors is not None
+        prefer = getattr(
+            self.encoder,
+            "prefer",
+            EncodeBackend.FFMPEG,
+        )
+        if requires_pillow or palette_png:
+            return EncodeBackend.PILLOW
+        if codec == ImageCodec.PNG or prefer == EncodeBackend.PILLOW:
+            return EncodeBackend.PILLOW
+        return EncodeBackend.FFMPEG
+
+    def _attempt_candidate(
+        self,
+        probe: ImageProbeResult,
+        work_dir: Path,
+        result: ImageJobResult,
+        *,
+        quality: int,
+        scale_factor: float = 1.0,
+        target_dimensions: Optional[ImageDimensions] = None,
+        webp_variant: WebPVariant = WebPVariant.LOSSY,
+        webp_method: int = WEBP_SEARCH_METHOD,
+        png_colors: Optional[int] = None,
+        label: str = "candidate",
     ) -> Optional[CompressionAttempt]:
         self.config.cancellation.raise_if_cancelled()
-        already_attempted = any(
-            attempt.quality == QUALITY_LOSSLESS_PROXY
-            and attempt.scale_factor == 1.0
-            for attempt in result.attempts
+        effective_dimensions = (
+            target_dimensions
+            or probe.processing_dimensions
+            or probe.dimensions
         )
-        if already_attempted:
+        effective_scale = probe.canvas_scale if probe.processing_path else scale_factor
+        key = self._attempt_key(
+            probe,
+            quality=quality,
+            scale_factor=effective_scale,
+            target_dimensions=effective_dimensions,
+            webp_variant=webp_variant,
+            webp_method=webp_method,
+            png_colors=png_colors,
+        )
+        cached = result.attempt_cache.get(key)
+        if key in result.attempted_keys:
+            if self._cached_attempt_available(cached):
+                return cached
             return None
-        tmp = unique_temp_path(work_dir, suffix=self._temp_suffix(probe.path))
-        attempt = self._encode(
-            probe.path,
-            tmp,
+        alias = self._predicted_attempt_alias(
+            probe,
+            quality=quality,
+            scale_factor=effective_scale,
+            target_dimensions=effective_dimensions,
+            webp_variant=webp_variant,
+            webp_method=webp_method,
+        )
+        if alias is not None:
+            cached = result.attempt_cache.get(alias)
+            if self._cached_attempt_available(cached):
+                result.attempted_keys.add(key)
+                result.attempt_cache[key] = cached
+                return cached
+        result.attempted_keys.add(key)
+        while True:
+            tmp = unique_temp_path(
+                work_dir,
+                suffix=self._temp_suffix(probe.path),
+                label=label,
+            )
+            attempt = self._encode(
+                probe,
+                tmp,
+                quality=quality,
+                scale_factor=effective_scale,
+                target_dimensions=effective_dimensions,
+                webp_variant=webp_variant,
+                webp_method=webp_method,
+                png_colors=png_colors,
+            )
+            result.attempts.append(attempt)
+            result.attempt_cache[key] = attempt
+            if attempt.success:
+                if not self._verify_attempt(
+                    probe,
+                    attempt,
+                    result,
+                    target_dimensions=effective_dimensions,
+                ):
+                    result.attempt_cache[key] = attempt
+                    self._discard_attempt(attempt)
+                    return None
+                success_alias = self._successful_attempt_alias(
+                    probe,
+                    attempt,
+                    scale_factor=effective_scale,
+                    target_dimensions=effective_dimensions,
+                    webp_variant=webp_variant,
+                    webp_method=webp_method,
+                )
+                if success_alias is not None:
+                    result.attempt_cache[success_alias] = attempt
+                return attempt
+            self._discard_attempt(attempt)
+            if (
+                attempt.transient_failure
+                and result.transient_retries.get(key, 0) < 1
+            ):
+                result.transient_retries[key] = 1
+                continue
+            return None
+
+    @staticmethod
+    def _cached_attempt_available(
+        attempt: Optional[CompressionAttempt],
+    ) -> bool:
+        return bool(
+            attempt is not None
+            and attempt.success
+            and attempt.verification is not None
+            and attempt.verification.structurally_valid
+            and attempt.output_path is not None
+            and attempt.output_path.is_file()
+        )
+
+    def _verify_attempt(
+        self,
+        probe: ImageProbeResult,
+        attempt: CompressionAttempt,
+        result: ImageJobResult,
+        *,
+        target_dimensions: Optional[ImageDimensions],
+    ) -> bool:
+        if attempt.output_path is None:
+            return False
+        expected_codec = result.target_codec or self._codec_for(probe.path)
+        expected_dimensions = target_dimensions or probe.dimensions
+        verification = self.verifier.verify(
+            attempt.output_path,
+            expected_codec=expected_codec,
+            expected_dimensions=expected_dimensions,
+            require_alpha=(
+                probe.has_alpha and expected_codec.preserves_alpha
+            ),
+            require_icc=(
+                self.config.preserve_icc_profile
+                and probe.has_icc_profile
+            ),
+            expected_icc_sha256=probe.icc_profile_sha256,
+            size_policy=self.config.size_policy,
+            enforce_size=False,
+        )
+        attempt.verification = verification
+        attempt.dimensions = verification.dimensions or expected_dimensions
+        attempt.output_bytes = verification.size_bytes
+        if verification.structurally_valid:
+            return True
+        attempt.success = False
+        attempt.error = verification.error or "output_verification_failed"
+        return False
+
+    def _phase_maximum_fidelity(
+        self, probe: ImageProbeResult, work_dir: Path, result: ImageJobResult
+    ) -> Optional[CompressionAttempt]:
+        codec = self._codec_for(probe.path)
+        variant = (
+            WebPVariant.LOSSLESS
+            if codec == ImageCodec.WEBP
+            else WebPVariant.LOSSY
+        )
+        return self._attempt_candidate(
+            probe,
+            work_dir,
+            result,
             quality=QUALITY_LOSSLESS_PROXY,
             scale_factor=1.0,
-            source_probe=probe,
+            webp_variant=variant,
+            label="maximum-fidelity",
         )
-        result.attempts.append(attempt)
-        if attempt.success:
-            return attempt
-        self._discard_attempt(attempt)
-        return None
 
     def _phase_quality_ladder(
         self,
@@ -2982,25 +5048,18 @@ class StrategyEngine:
     ) -> Optional[CompressionAttempt]:
         best = previous_best
         for q in dict.fromkeys(qualities):
-            self.config.cancellation.raise_if_cancelled()
-            tmp = unique_temp_path(work_dir, suffix=self._temp_suffix(probe.path))
-            attempt = self._encode(
-                probe.path,
-                tmp,
+            attempt = self._attempt_candidate(
+                probe,
+                work_dir,
+                result,
                 quality=q,
                 scale_factor=scale_factor,
-                source_probe=probe,
+                webp_variant=WebPVariant.LOSSY,
+                label="quality",
             )
-            result.attempts.append(attempt)
-            if not attempt.success:
-                self._discard_attempt(attempt)
+            if attempt is None:
                 continue
-            selected = self._better_attempt(best, attempt)
-            if selected is attempt:
-                self._discard_attempt(best)
-                best = attempt
-            else:
-                self._discard_attempt(attempt)
+            best = self._retain_better(best, attempt)
             if best and best.is_preferred(self.config.size_policy):
                 return best
         return best
@@ -3023,97 +5082,105 @@ class StrategyEngine:
             lo, hi = (hi, lo)
         best = previous_best
         iterations = 0
+        failed_recovery_attempts = 0
+        tried: set[int] = set()
+        boundary_quality: Optional[int] = None
+        acceptable_boundary: Optional[int] = (
+            best.quality
+            if best is not None
+            and best.quality is not None
+            and best.is_acceptable(self.config.size_policy)
+            else None
+        )
         while lo <= hi and iterations < BINARY_SEARCH_MAX_ITERS:
             self.config.cancellation.raise_if_cancelled()
             iterations += 1
             mid = (lo + hi) // 2
-            tmp = unique_temp_path(work_dir, suffix=self._temp_suffix(probe.path))
-            attempt = self._encode(
-                probe.path,
-                tmp,
-                quality=mid,
-                scale_factor=scale_factor,
-                target_dimensions=target_dims,
-                source_probe=probe,
+            if mid in tried:
+                break
+            candidate_qualities = [mid]
+            candidate_qualities.extend(
+                quality
+                for offset in BINARY_FAILURE_OFFSETS
+                if lo <= (quality := mid + offset) <= hi
+                and quality not in tried
             )
-            result.attempts.append(attempt)
-            if not attempt.success:
-                self._discard_attempt(attempt)
-                self.config.cancellation.raise_if_cancelled()
-                retry_tmp = unique_temp_path(
+            attempt: Optional[CompressionAttempt] = None
+            used_quality: Optional[int] = None
+            for index, quality in enumerate(candidate_qualities):
+                if index > 0:
+                    if (
+                        failed_recovery_attempts
+                        >= BINARY_FAILURE_ATTEMPT_BUDGET
+                    ):
+                        break
+                    failed_recovery_attempts += 1
+                tried.add(quality)
+                attempt = self._attempt_candidate(
+                    probe,
                     work_dir,
-                    suffix=self._temp_suffix(probe.path),
-                    label="retry",
-                )
-                attempt = self._encode(
-                    probe.path,
-                    retry_tmp,
-                    quality=mid,
+                    result,
+                    quality=quality,
                     scale_factor=scale_factor,
                     target_dimensions=target_dims,
-                    source_probe=probe,
+                    webp_variant=WebPVariant.LOSSY,
+                    label="binary" if index == 0 else "binary-recovery",
                 )
-                result.attempts.append(attempt)
-                if not attempt.success:
-                    self._discard_attempt(attempt)
-                    hi = mid - 1
+                if attempt is not None:
+                    used_quality = quality
+                    break
+            if attempt is None or used_quality is None:
+                break
+            preferred = attempt.is_preferred(self.config.size_policy)
+            if attempt.is_acceptable(self.config.size_policy):
+                acceptable_boundary = max(
+                    acceptable_boundary or used_quality,
+                    used_quality,
+                )
+            best = self._retain_better(best, attempt)
+            if preferred:
+                boundary_quality = used_quality
+                lo = used_quality + 1
+            else:
+                hi = used_quality - 1
+        refinement_boundary = boundary_quality or acceptable_boundary
+        if refinement_boundary is not None:
+            refinement = range(
+                max(clamp(q_lo, 1, 100), refinement_boundary - BINARY_REFINEMENT_RADIUS),
+                min(clamp(q_hi, 1, 100), refinement_boundary + BINARY_REFINEMENT_RADIUS) + 1,
+            )
+            for quality in refinement:
+                if quality in tried:
                     continue
-            selected = self._better_attempt(best, attempt)
-            if selected is attempt:
-                self._discard_attempt(best)
-                best = attempt
-            else:
-                self._discard_attempt(attempt)
-            if attempt.is_preferred(self.config.size_policy):
-                lo = mid + 1
-            else:
-                hi = mid - 1
+                tried.add(quality)
+                attempt = self._attempt_candidate(
+                    probe,
+                    work_dir,
+                    result,
+                    quality=quality,
+                    scale_factor=scale_factor,
+                    target_dimensions=target_dims,
+                    webp_variant=WebPVariant.LOSSY,
+                    label="refine",
+                )
+                if attempt is None:
+                    continue
+                best = self._retain_better(best, attempt)
         return best
 
-    def _phase_downscale_search(
+    def _retain_better(
         self,
-        probe: ImageProbeResult,
-        work_dir: Path,
-        result: ImageJobResult,
-        *,
-        previous_best: Optional[CompressionAttempt] = None,
-    ) -> Optional[CompressionAttempt]:
-        if probe.dimensions is None:
-            return previous_best
-        best = previous_best
-        for factor in DOWNSCALE_FACTORS:
-            self.config.cancellation.raise_if_cancelled()
-            target = probe.dimensions.scaled(factor)
-            if (
-                target.width == probe.dimensions.width
-                and target.height == probe.dimensions.height
-                and (factor < 1.0)
-            ):
-                continue
-            self.logger.debug("Downscale %.0f%% → %s for %s", factor * 100, target, probe.path.name)
-            candidate = self._phase_binary_search(
-                probe,
-                work_dir,
-                result,
-                q_lo=QUALITY_BINARY_MIN,
-                q_hi=QUALITY_BINARY_MAX,
-                scale_factor=target.scale_from(probe.dimensions),
-                target_dims=target,
-                previous_best=None,
-            )
-            if candidate is not None:
-                if candidate.dimensions is None:
-                    candidate.dimensions = target
-                candidate.scale_factor = target.scale_from(probe.dimensions)
-                selected = self._better_attempt(best, candidate)
-                if selected is candidate:
-                    self._discard_attempt(best)
-                    best = candidate
-                else:
-                    self._discard_attempt(candidate)
-                if best and best.is_preferred(self.config.size_policy):
-                    return best
-        return best
+        current: Optional[CompressionAttempt],
+        new: CompressionAttempt,
+    ) -> CompressionAttempt:
+        selected = self._better_attempt(current, new)
+        if selected is new:
+            if current is not new:
+                self._discard_attempt(current)
+            return new
+        if current is not new:
+            self._discard_attempt(new)
+        return selected
 
     def _better_attempt(
         self, current: Optional[CompressionAttempt], new: CompressionAttempt
@@ -3145,7 +5212,7 @@ class StrategyEngine:
         nq, cq = (new.quality or 0, current.quality or 0)
         if nq != cq:
             return new if nq > cq else current
-        return new if new.output_bytes > current.output_bytes else current
+        return new if new.output_bytes < current.output_bytes else current
 
     @staticmethod
     def _discard_attempt(attempt: Optional[CompressionAttempt]) -> None:
@@ -3166,15 +5233,86 @@ class StrategyEngine:
         for attempt in result.attempts:
             cls._discard_attempt(attempt)
 
+    def _verify_output(
+        self,
+        path: Path,
+        best: CompressionAttempt,
+        result: ImageJobResult,
+    ) -> OutputVerification:
+        expected_codec = result.target_codec or self._codec_for(result.source)
+        return self.verifier.verify(
+            path,
+            expected_codec=expected_codec,
+            expected_dimensions=best.dimensions or result.original_dimensions,
+            require_alpha=(
+                result.source_has_alpha and expected_codec.preserves_alpha
+            ),
+            require_icc=(
+                self.config.preserve_icc_profile
+                and result.source_has_icc_profile
+            ),
+            expected_icc_sha256=result.source_icc_profile_sha256,
+            size_policy=self.config.size_policy,
+        )
+
+    def _record_verification_failure(
+        self,
+        best: CompressionAttempt,
+        result: ImageJobResult,
+        verification: OutputVerification,
+    ) -> None:
+        result.verification = verification
+        best.output_bytes = verification.size_bytes
+        if (
+            verification.structurally_valid
+            and verification.size_acceptable is False
+        ):
+            result.status = ImageStatus.SIZE_LIMIT_FAILED
+            result.output_bytes = verification.size_bytes
+            result.quality_used = best.quality
+            result.ffmpeg_q_used = best.ffmpeg_q
+            result.scale_factor = best.scale_factor
+            result.backend = best.backend
+            result.variant = best.variant
+            result.webp_method = best.webp_method
+            result.png_colors = best.png_colors
+            result.message = t(
+                "msg_size_fail",
+                limit=human_bytes(self.config.max_bytes, binary=False),
+                best=human_bytes(verification.size_bytes, binary=False),
+            )
+        else:
+            result.status = ImageStatus.FAILED
+            result.message = "output_verification_failed"
+        result.error_detail = verification.error
+
+    def _verify_candidate(
+        self,
+        best: CompressionAttempt,
+        result: ImageJobResult,
+    ) -> bool:
+        if best.output_path is None:
+            return False
+        expected_dimensions = best.dimensions or result.original_dimensions
+        verification = self._verify_output(best.output_path, best, result)
+        result.verification = verification
+        best.output_bytes = verification.size_bytes
+        if verification.valid:
+            best.dimensions = verification.dimensions or expected_dimensions
+            return True
+        self._record_verification_failure(best, result, verification)
+        self._discard_attempt(best)
+        return False
+
     def _commit_best(
         self,
+        probe: ImageProbeResult,
+        work_dir: Path,
         best: CompressionAttempt,
         final_dest: Path,
         result: ImageJobResult,
-        *,
-        quality: Optional[int] = None,
     ) -> None:
-        del quality
+        best = self._finalize_webp_candidate(probe, work_dir, best, result)
         final_dest.parent.mkdir(parents=True, exist_ok=True)
         if not (
             best.success
@@ -3186,64 +5324,84 @@ class StrategyEngine:
             result.message = "selected_candidate_missing"
             result.error_detail = best.error
             return
-        live_size = file_size(best.output_path)
-        if live_size > 0:
-            best.output_bytes = live_size
-        if not self.config.size_policy.is_acceptable(best.output_bytes):
-            result.status = ImageStatus.SIZE_LIMIT_FAILED
-            result.output_bytes = best.output_bytes
-            result.quality_used = best.quality
-            result.ffmpeg_q_used = best.ffmpeg_q
-            result.scale_factor = best.scale_factor
-            result.backend = best.backend
-            result.variant = best.variant
-            result.message = t(
-                "msg_size_fail",
-                limit=human_bytes(self.config.max_bytes, binary=False),
-                best=human_bytes(best.output_bytes),
-            )
-            self._discard_attempt(best)
-            return
         try:
-            self.config.cancellation.run_if_active(
-                lambda: atomic_publish(
-                    best.output_path,
-                    final_dest,
-                    overwrite=self.config.overwrite_output,
-                )
-            )
-            best.output_path = None
-            fsync_directory(final_dest.parent)
-        except UserAbortError:
+            candidate_verified = self._verify_candidate(best, result)
+        except ProcessTerminationError:
             raise
-        except Exception as exc:
+        except BaseException:
+            self._discard_attempt(best)
+            raise
+        if not candidate_verified:
+            return
+        published = False
+
+        def publish_and_verify() -> OutputVerification:
+            nonlocal published
+            atomic_publish(
+                best.output_path,
+                final_dest,
+                overwrite=(
+                    self.config.overwrite_output
+                    or self.config.reprocess_existing
+                ),
+            )
+            published = True
+            best.output_path = None
+            try:
+                fsync_directory(final_dest.parent)
+            except OSError:
+                pass
+            return self._verify_output(final_dest, best, result)
+
+        def discard_publication() -> None:
+            if published:
+                try:
+                    final_dest.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            else:
+                self._discard_attempt(best)
+            result.output_path = None
+
+        try:
+            verification = self.config.cancellation.run_if_active(
+                publish_and_verify
+            )
+        except (UserAbortError, ProcessTerminationError):
+            discard_publication()
+            raise
+        except BaseException as exc:
+            discard_publication()
+            if not isinstance(exc, Exception):
+                raise
             result.status = ImageStatus.FAILED
             result.message = "commit_failed"
             result.error_detail = f"{type(exc).__name__}: {exc}"
-            self._discard_attempt(best)
             return
         result.output_path = final_dest
-        result.output_bytes = file_size(final_dest)
-        if not self.config.size_policy.is_acceptable(result.output_bytes):
-            result.status = ImageStatus.FAILED
-            result.message = "published_output_validation_failed"
-            result.error_detail = (
-                "published output is missing or violates the strict size limit"
-            )
+        result.verification = verification
+        result.output_bytes = verification.size_bytes
+        if not verification.valid:
+            self._record_verification_failure(best, result, verification)
             try:
                 final_dest.unlink(missing_ok=True)
             except OSError:
                 pass
             result.output_path = None
             return
-        result.output_dimensions = best.dimensions or result.original_dimensions
-        if result.output_dimensions and result.original_dimensions:
-            best.scale_factor = result.output_dimensions.scale_from(result.original_dimensions)
+        best.dimensions = (
+            verification.dimensions
+            or best.dimensions
+            or result.original_dimensions
+        )
+        result.output_dimensions = best.dimensions
         result.quality_used = best.quality
         result.ffmpeg_q_used = best.ffmpeg_q
         result.scale_factor = best.scale_factor
         result.backend = best.backend
         result.variant = best.variant
+        result.webp_method = best.webp_method
+        result.png_colors = best.png_colors
         result.status = ImageStatus.COMPRESSED
         result.message = t(
             "msg_compressed",
@@ -3252,8 +5410,46 @@ class StrategyEngine:
             scale=result.scale_factor,
         )
 
+    def _finalize_webp_candidate(
+        self,
+        probe: ImageProbeResult,
+        work_dir: Path,
+        best: CompressionAttempt,
+        result: ImageJobResult,
+    ) -> CompressionAttempt:
+        if (
+            self._codec_for(probe.path) != ImageCodec.WEBP
+            or best.backend == EncodeBackend.COPY
+            or best.webp_method == WEBP_FINAL_METHOD
+        ):
+            return best
+        variant = (
+            WebPVariant.LOSSLESS
+            if best.variant and best.variant.startswith(WebPVariant.LOSSLESS.value)
+            else WebPVariant.LOSSY
+        )
+        final_attempt = self._attempt_candidate(
+            probe,
+            work_dir,
+            result,
+            quality=best.quality or QUALITY_LOSSLESS_PROXY,
+            webp_variant=variant,
+            webp_method=WEBP_FINAL_METHOD,
+            label="webp-final",
+        )
+        if final_attempt and final_attempt.is_acceptable(self.config.size_policy):
+            self._discard_attempt(best)
+            return final_attempt
+        self._discard_attempt(final_attempt)
+        return best
+
     def _fail_or_commit_closest(
-        self, best: Optional[CompressionAttempt], final_dest: Path, result: ImageJobResult
+        self,
+        probe: ImageProbeResult,
+        work_dir: Path,
+        best: Optional[CompressionAttempt],
+        final_dest: Path,
+        result: ImageJobResult,
     ) -> None:
         if best is None or not best.success:
             result.status = ImageStatus.FAILED
@@ -3262,7 +5458,7 @@ class StrategyEngine:
                 result.error_detail = result.attempts[-1].error
             return
         if best.is_acceptable(self.config.size_policy):
-            self._commit_best(best, final_dest, result)
+            self._commit_best(probe, work_dir, best, final_dest, result)
             return
         result.status = ImageStatus.SIZE_LIMIT_FAILED
         result.output_bytes = best.output_bytes
@@ -3271,6 +5467,8 @@ class StrategyEngine:
         result.scale_factor = best.scale_factor
         result.backend = best.backend
         result.variant = best.variant
+        result.webp_method = best.webp_method
+        result.png_colors = best.png_colors
         self._discard_attempt(best)
         result.message = t(
             "msg_unable",
@@ -3302,14 +5500,51 @@ class PreflightScanner:
         self.size_policy = size_policy
         self.cancellation = cancellation or CancellationToken()
 
-    def discover_files(self) -> List[Path]:
+    def discover_files(self, *, recursive: bool = False) -> List[Path]:
         found: List[Path] = []
         try:
-            entries = sorted(self.root.iterdir(), key=lambda p: p.name.lower())
+            if recursive:
+                entries: List[Path] = []
+                for current, directories, filenames in os.walk(
+                    self.root,
+                    followlinks=False,
+                ):
+                    current_path = Path(current)
+                    directories[:] = sorted(
+                        (
+                            name
+                            for name in directories
+                            if not (current_path / name).is_symlink()
+                            and name != TEMP_WORKDIR_NAME
+                            and not (
+                                self.output_dir
+                                and is_within_directory(
+                                    current_path / name,
+                                    self.output_dir,
+                                )
+                            )
+                        ),
+                        key=str.casefold,
+                    )
+                    entries.extend(
+                        current_path / name
+                        for name in sorted(
+                            filenames,
+                            key=str.casefold,
+                        )
+                    )
+            else:
+                entries = sorted(
+                    self.root.iterdir(),
+                    key=lambda path: path.name.casefold(),
+                )
         except OSError as exc:
-            raise WorkspaceError(f"Cannot list directory {self.root}: {exc}", cause=exc) from exc
+            raise WorkspaceError(
+                f"Cannot list directory {self.root}: {exc}",
+                cause=exc,
+            ) from exc
         for entry in entries:
-            if not entry.is_file():
+            if not entry.is_file() or entry.is_symlink():
                 continue
             if self.output_dir and is_within_directory(entry, self.output_dir):
                 continue
@@ -3320,12 +5555,23 @@ class PreflightScanner:
                 found.append(entry)
             elif self.include_convertibles and suffix in CONVERTIBLE_EXTENSIONS:
                 found.append(entry)
-        return found
+        return sorted(
+            found,
+            key=lambda path: (
+                str(path.relative_to(self.root)).casefold(),
+                str(path.relative_to(self.root)),
+            ),
+        )
 
-    def scan(self, *, max_workers: int = 4) -> PreflightSummary:
+    def scan(
+        self,
+        *,
+        max_workers: int = 4,
+        recursive: bool = False,
+    ) -> PreflightSummary:
         t0 = time.perf_counter()
         self.cancellation.raise_if_cancelled()
-        files = self.discover_files()
+        files = self.discover_files(recursive=recursive)
         self.logger.info("Discovered %d candidate image(s) in %s", len(files), self.root)
         images: List[ImageProbeResult] = []
         workers = max(1, min(max_workers, len(files) or 1))
@@ -3340,7 +5586,10 @@ class PreflightScanner:
                     try:
                         images.append(fut.result())
                     except Exception as exc:
-                        if isinstance(exc, UserAbortError):
+                        if isinstance(
+                            exc,
+                            (UserAbortError, ProcessTerminationError),
+                        ):
                             raise exc
                         self.logger.warning("Probe crash on %s: %s", path.name, exc)
                         images.append(
@@ -3358,7 +5607,11 @@ class PreflightScanner:
                                 probe_error=str(exc),
                             )
                         )
-        except (KeyboardInterrupt, UserAbortError):
+        except (
+            KeyboardInterrupt,
+            UserAbortError,
+            ProcessTerminationError,
+        ):
             self.cancellation.cancel()
             cancel_all = getattr(self.prober.runner, "cancel_all", None)
             if callable(cancel_all):
@@ -3410,8 +5663,17 @@ class PreflightScanner:
         savings_low = 0
         savings_high = 0
         for img in over:
-            est_high_q = estimate_output_bytes(img.size_bytes, 93)
-            est_low_q = estimate_output_bytes(img.size_bytes, 55)
+            codec = detect_source_codec(img.path)
+            est_high_q = estimate_output_bytes(
+                img.size_bytes,
+                93,
+                codec=codec,
+            )
+            est_low_q = estimate_output_bytes(
+                img.size_bytes,
+                55,
+                codec=codec,
+            )
             max_save = max(0, img.size_bytes - self.size_policy.preferred_target_bytes)
             savings_low += min(max_save, max(0, img.size_bytes - est_high_q))
             savings_high += min(max_save, max(0, img.size_bytes - est_low_q))
@@ -3447,8 +5709,8 @@ class PreflightScanner:
             corrupt_count=len(corrupt),
             total_bytes=total_bytes,
             over_limit_bytes=over_bytes,
-            potential_savings_low_mb=savings_low / (1024 * 1024),
-            potential_savings_high_mb=savings_high / (1024 * 1024),
+            potential_savings_low_mb=savings_low / 1_000_000,
+            potential_savings_high_mb=savings_high / 1_000_000,
             scan_elapsed_sec=elapsed,
             dimension_stats=dim_stats,
             potential_histogram=dict(pot_hist),
@@ -3506,9 +5768,13 @@ class CLI:
                     return
                 print(t("invalid_selection"))
 
-    def banner(self) -> None:
+    def banner(self, size_policy: SizePolicy = DEFAULT_SIZE_POLICY) -> None:
         title = f"{SCRIPT_NAME} v{SCRIPT_VERSION}"
-        subtitle = t("banner_subtitle")
+        subtitle = t(
+            "banner_subtitle",
+            target_mb=f"{size_policy.strict_max_bytes / 1_000_000:g}",
+            target_bytes=f"{size_policy.strict_max_bytes:,}",
+        )
         if self.console is not None:
             banner_text = Text(title, style="title")
             banner_text.append("\n")
@@ -3592,12 +5858,12 @@ class CLI:
                 t("need_compression"), f"[size_bad]{summary.over_limit_count}[/size_bad]"
             )
             overview.add_row(t("unreadable_corrupt"), f"[warning]{summary.corrupt_count}[/warning]")
-            overview.add_row(t("total_size"), human_bytes(summary.total_bytes))
-            overview.add_row(t("over_limit_mass"), human_bytes(summary.over_limit_bytes))
+            overview.add_row(t("total_size"), human_bytes(summary.total_bytes, binary=False))
+            overview.add_row(t("over_limit_mass"), human_bytes(summary.over_limit_bytes, binary=False))
             overview.add_row(
-                t("est_savings_gentle"), f"~{summary.potential_savings_low_mb:.1f} MiB"
+                t("est_savings_gentle"), f"~{summary.potential_savings_low_mb:.1f} MB"
             )
-            overview.add_row(t("est_savings_aggr"), f"~{summary.potential_savings_high_mb:.1f} MiB")
+            overview.add_row(t("est_savings_aggr"), f"~{summary.potential_savings_high_mb:.1f} MB")
             overview.add_row(t("scan_time"), human_duration(summary.scan_elapsed_sec))
             if summary.dimension_stats:
                 ds = summary.dimension_stats
@@ -3670,7 +5936,7 @@ class CLI:
                 f"  {t('plain_under_over', u=summary.under_limit_count, o=summary.over_limit_count)}"
             )
             print(f"  {t('plain_corrupt', n=summary.corrupt_count)}")
-            print(f"  {t('plain_total', s=human_bytes(summary.total_bytes))}")
+            print(f"  {t('plain_total', s=human_bytes(summary.total_bytes, binary=False))}")
             print(
                 f"  {t('plain_savings', lo=summary.potential_savings_low_mb, hi=summary.potential_savings_high_mb)}"
             )
@@ -3754,10 +6020,34 @@ class CLI:
                         return s
                 print(t("invalid_selection_abc"))
 
-    def select_output_format(self) -> OutputFormatChoice:
+    def recommend_output_format(
+        self,
+        summary: PreflightSummary,
+    ) -> OutputFormatChoice:
+        if any(image.has_alpha for image in summary.images if image.is_readable):
+            return OutputFormatChoice.KEEP_ORIGINAL
+        return OutputFormatChoice.JPG
+
+    def select_output_format(
+        self,
+        summary: Optional[PreflightSummary] = None,
+        available_choices: Optional[Sequence[OutputFormatChoice]] = None,
+    ) -> OutputFormatChoice:
         self.rule(rich_escape(t("rule_format")))
-        options = list(OutputFormatChoice)
-        recommended = OutputFormatChoice.JPG
+        options = list(available_choices or OutputFormatChoice)
+        if not options:
+            raise CompressorError("no output format is available")
+        recommended = (
+            self.recommend_output_format(summary)
+            if summary is not None
+            else OutputFormatChoice.JPG
+        )
+        if recommended not in options:
+            recommended = (
+                OutputFormatChoice.KEEP_ORIGINAL
+                if OutputFormatChoice.KEEP_ORIGINAL in options
+                else options[0]
+            )
         if self.console is not None:
             table = Table(title=t("format_available"), box=box.ROUNDED, show_lines=True)
             table.add_column(t("col_opt"), style="accent", justify="center")
@@ -3819,6 +6109,42 @@ class CLI:
         raw = input(t("continue_yn")).strip().lower()
         return raw in ("", "y", "yes")
 
+    def select_resize_mode(self) -> ResizeMode:
+        options = (
+            ("1", ResizeMode.ALL, t("resize_all")),
+            ("2", ResizeMode.OUTLIERS, t("resize_outliers")),
+            ("3", ResizeMode.NONE, t("resize_none")),
+        )
+        if self.console is not None:
+            table = Table(show_header=False, box=box.SIMPLE, padding=(0, 2))
+            table.add_column("k", style="accent")
+            table.add_column("v")
+            for key, _, label in options:
+                table.add_row(key, label)
+            self.console.print(table)
+            selected = Prompt.ask(
+                t("resize_prompt"),
+                choices=[key for key, _, _ in options],
+                default="2",
+                console=self.console,
+            )
+        else:
+            print(f"\n{t('resize_prompt')}:")
+            for key, _, label in options:
+                print(f"  {key}) {label}")
+            selected = input("[2]: ").strip() or "2"
+        return next(mode for key, mode, _ in options if key == selected)
+
+    def confirm_switch_to_all(self) -> bool:
+        if self.console is not None:
+            return Confirm.ask(
+                t("resize_switch_all"),
+                default=False,
+                console=self.console,
+            )
+        print(t("resize_switch_all"))
+        return input("[y/N]: ").strip().casefold() in ("y", "yes")
+
     def show_batch_report(self, report: BatchReport) -> None:
         self.rule(rich_escape(t("rule_complete")))
         fail_statuses = (
@@ -3835,11 +6161,16 @@ class CLI:
             table.add_column(t("value"), justify="right")
             table.add_row(t("res_strategy"), report.config.strategy.title)
             table.add_row(t("res_format"), report.config.output_format.title)
+            table.add_row(t("res_resize_mode"), report.config.resize_mode.value)
+            table.add_row(
+                t("res_page_canvas"),
+                str(report.config.page_canvas) if report.config.page_canvas else "—",
+            )
             table.add_row(t("res_elapsed"), human_duration(report.total_elapsed_sec))
             table.add_row(t("res_compressed"), str(report.compressed_count))
             table.add_row(t("res_copied"), str(report.copied_count))
             table.add_row(t("res_failed"), str(report.failed_count))
-            table.add_row(t("res_saved"), human_bytes(report.total_saved_bytes))
+            table.add_row(t("res_saved"), human_bytes(report.total_saved_bytes, binary=False))
             table.add_row(t("res_output"), Text(str(report.config.output_dir)))
             self.console.print(table)
 
@@ -3875,7 +6206,7 @@ class CLI:
                     note = r.message or "—"
                 detail.add_row(
                     Text(r.source.name),
-                    Text(r.status.name, style=status_style),
+                    Text(status_label(r.status), style=status_style),
                     human_bytes(r.original_bytes),
                     out_s,
                     saved_s,
@@ -3899,18 +6230,23 @@ class CLI:
                 for r in failed_rows:
                     fail_table.add_row(
                         Text(r.source.name),
-                        r.status.name,
+                        status_label(r.status),
                         Text(friendly_failure_reason(r)),
                     )
                 self.console.print(fail_table)
         else:
             print(f"  {t('res_strategy')}: {report.config.strategy.title}")
             print(f"  {t('res_format')}: {report.config.output_format.title}")
+            print(f"  {t('res_resize_mode')}: {report.config.resize_mode.value}")
+            print(
+                f"  {t('res_page_canvas')}: "
+                f"{report.config.page_canvas if report.config.page_canvas else '—'}"
+            )
             print(f"  {t('res_elapsed')}: {human_duration(report.total_elapsed_sec)}")
             print(f"  {t('res_compressed')}: {report.compressed_count}")
             print(f"  {t('res_copied')}: {report.copied_count}")
             print(f"  {t('res_failed')}: {report.failed_count}")
-            print(f"  {t('res_saved')}: {human_bytes(report.total_saved_bytes)}")
+            print(f"  {t('res_saved')}: {human_bytes(report.total_saved_bytes, binary=False)}")
             print(f"  {t('res_output')}: {report.config.output_dir}")
             for r in report.results:
                 if r.status in fail_statuses:
@@ -3918,7 +6254,7 @@ class CLI:
                 else:
                     note = r.message
                 print(
-                    f"  - {r.source.name}: {r.status.name} "
+                    f"  - {r.source.name}: {status_label(r.status)} "
                     f"{human_bytes(r.original_bytes)} → {human_bytes(r.output_bytes)} | {note}"
                 )
             if failed_rows:
@@ -3926,7 +6262,7 @@ class CLI:
                 print(f"  === {t('fail_section_title')} ===")
                 for r in failed_rows:
                     print(f"  ! {r.source.name}")
-                    print(f"      {r.status.name}: {friendly_failure_reason(r)}")
+                    print(f"      {status_label(r.status)}: {friendly_failure_reason(r)}")
 
     def progress(self) -> Any:
         if self.console is not None:
@@ -3950,22 +6286,21 @@ class _NullProgress:
         return self
 
     def __exit__(self, *args: Any) -> None:
-        return None
+        if len(args) != 3:
+            raise ValueError("invalid context manager exit")
 
     def add_task(self, description: str, total: Optional[float] = None) -> int:
+        if total is not None and total < 0:
+            raise ValueError("progress total cannot be negative")
         print(f"  >> {description}")
         return 0
 
     def update(self, task_id: int, **kwargs: Any) -> None:
-        advance = kwargs.get("advance")
+        if task_id != 0:
+            raise ValueError("unknown progress task")
         description = kwargs.get("description")
         if description:
             print(f"  .. {description}")
-        elif advance:
-            pass
-
-    def advance(self, task_id: int, advance: float = 1) -> None:
-        pass
 
 
 class OutputReservation:
@@ -4015,17 +6350,31 @@ class OutputPlanner:
         ordered = sorted(
             images,
             key=lambda image: (
-                image.path.name.casefold(),
-                image.path.name,
+                self._relative_sort_key(image.path).casefold(),
+                self._relative_sort_key(image.path),
             ),
         )
         try:
             for image in ordered:
-                stem = safe_filename(image.path.stem)
+                relative_parent = Path()
+                if self.config.recursive:
+                    try:
+                        relative_parent = image.path.relative_to(
+                            self.config.root_dir
+                        ).parent
+                    except ValueError:
+                        relative_parent = Path()
+                parent = self.config.output_dir / relative_parent
+                parent.mkdir(parents=True, exist_ok=True)
                 ext = resolve_output_codec(
                     image.path,
                     self.config.output_format,
                 ).extension
+                stem = self._budgeted_stem(
+                    image.path.stem,
+                    parent,
+                    ext,
+                )
                 index = 1
                 while True:
                     candidate = (
@@ -4033,11 +6382,11 @@ class OutputPlanner:
                         if index == 1
                         else f"{stem}_{index}{ext}"
                     )
-                    folded = candidate.casefold()
+                    folded = str(relative_parent / candidate).casefold()
                     index += 1
                     if folded in reserved:
                         continue
-                    path = self.config.output_dir / candidate
+                    path = parent / candidate
                     marker: Optional[Path] = None
                     token: Optional[str] = None
                     if not self.config.overwrite_output:
@@ -4060,6 +6409,53 @@ class OutputPlanner:
                 reservation.release()
             raise
         return plan
+
+    def _relative_sort_key(self, path: Path) -> str:
+        try:
+            return str(path.relative_to(self.config.root_dir))
+        except ValueError:
+            return str(path)
+
+    @staticmethod
+    def _budgeted_stem(
+        stem: str,
+        parent: Path,
+        extension: str,
+    ) -> str:
+        cleaned = safe_filename(stem)
+        if os.name != "nt":
+            return cleaned
+        try:
+            parent_length = len(str(parent.resolve()))
+        except OSError:
+            parent_length = len(str(parent.absolute()))
+        reservation_name_length = len(
+            ".jpeg-compressor-.reserve"
+        ) + 32
+        if (
+            parent_length
+            + 1
+            + reservation_name_length
+            > WINDOWS_PATH_BUDGET
+        ):
+            raise WorkspaceError(
+                f"Output directory path is too long: {parent}"
+            )
+        available = (
+            WINDOWS_PATH_BUDGET
+            - parent_length
+            - len(extension)
+            - 12
+        )
+        digest = hashlib.sha256(cleaned.encode("utf-8")).hexdigest()[:10]
+        if available < len(digest) + 2:
+            raise WorkspaceError(
+                f"Output directory path is too long: {parent}"
+            )
+        if len(cleaned) <= available:
+            return cleaned
+        prefix = cleaned[: max(1, available - len(digest) - 1)].rstrip(" .")
+        return f"{prefix or 'image'}_{digest}"
 
     @staticmethod
     def _claim(
@@ -4130,7 +6526,19 @@ class OutputPlanner:
             payload = json.loads(marker.read_text(encoding="utf-8"))
             pid = int(payload.get("pid", 0))
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
-            return False
+            try:
+                age = time.time() - marker.stat().st_mtime
+            except OSError:
+                return False
+            if age < STALE_MARKER_AGE_SEC:
+                return False
+            try:
+                marker.unlink()
+                return True
+            except FileNotFoundError:
+                return True
+            except OSError:
+                return False
         if pid <= 0 or OutputPlanner._pid_is_running(pid):
             return False
         try:
@@ -4182,8 +6590,15 @@ class BatchProcessor:
         self.engine = engine
         self.logger = logger
         self.cli = cli
+        self.canvas_preparer = CanvasPreparer(config, logger)
+        self.destination_paths: Dict[Path, Path] = {}
 
-    def run(self, images: Sequence[ImageProbeResult]) -> List[ImageJobResult]:
+    def run(
+        self,
+        images: Sequence[ImageProbeResult],
+        *,
+        reuse_destinations: bool = False,
+    ) -> List[ImageJobResult]:
         self.config.cancellation.raise_if_cancelled()
         self.config.output_dir.mkdir(parents=True, exist_ok=True)
         results: List[ImageJobResult] = []
@@ -4191,14 +6606,51 @@ class BatchProcessor:
         if total == 0:
             return results
         destinations: Dict[Path, OutputReservation] = {}
+        retain_run_root = threading.Event()
         run_root = (
             self.config.output_dir
             / TEMP_WORKDIR_NAME
-            / f"run_{uuid.uuid4().hex}"
+            / f"run_{uuid.uuid4().hex[:16]}"
         )
         try:
-            destinations = OutputPlanner(self.config).plan(images)
+            ensure_path_budget(
+                run_root / ".owner.json",
+                label="Temporary run path",
+            )
+            self._reclaim_stale_runs(run_root.parent)
+            if reuse_destinations:
+                missing = [image.path for image in images if image.path not in self.destination_paths]
+                if missing:
+                    raise WorkspaceError("reprocessing destination plan is incomplete")
+                destinations = {
+                    image.path: OutputReservation(
+                        self.destination_paths[image.path],
+                        None,
+                        None,
+                    )
+                    for image in images
+                }
+            else:
+                destinations = OutputPlanner(self.config).plan(images)
+                self.destination_paths.update(
+                    {
+                        source: reservation.path
+                        for source, reservation in destinations.items()
+                    }
+                )
             run_root.mkdir(parents=True, exist_ok=True)
+            (run_root / ".owner.json").write_text(
+                json.dumps(
+                    {
+                        "pid": os.getpid(),
+                        "created_utc": datetime.now(
+                            timezone.utc
+                        ).isoformat(),
+                        "cleanup_safe": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
         except Exception:
             for reservation in destinations.values():
                 reservation.release()
@@ -4209,27 +6661,86 @@ class BatchProcessor:
                 pass
             raise
 
+        def mark_cleanup_safe() -> None:
+            owner = run_root / ".owner.json"
+            stage = run_root / ".owner.cleanup-safe"
+            stage.write_text(
+                json.dumps(
+                    {
+                        "pid": os.getpid(),
+                        "created_utc": datetime.now(
+                            timezone.utc
+                        ).isoformat(),
+                        "cleanup_safe": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            atomic_replace(stage, owner)
+
         def job(probe: ImageProbeResult) -> ImageJobResult:
             reservation = destinations[probe.path]
             work_dir: Optional[Path] = None
             result: Optional[ImageJobResult] = None
             try:
                 self.config.cancellation.raise_if_cancelled()
-                work_dir = run_root / (
-                    f"{safe_filename(probe.path.stem)}_"
-                    f"{uuid.uuid4().hex[:10]}"
-                )
+                work_dir = self._work_dir_for(run_root, probe.path)
                 work_dir.mkdir(parents=True, exist_ok=True)
+                processing_probe = self.canvas_preparer.prepare(probe, work_dir)
                 result = self.engine.process_image(
-                    probe,
+                    processing_probe,
                     reservation.path,
                     work_dir,
+                )
+                return result
+            except ProcessTerminationError as exc:
+                self.config.cancellation.cancel()
+                retain_run_root.set()
+                marker_error: Optional[OSError] = None
+                try:
+                    (run_root / UNCONFIRMED_PROCESS_MARKER).touch(
+                        exist_ok=True
+                    )
+                except OSError as error:
+                    marker_error = error
+                    self.logger.error(
+                        "Could not mark retained process workspace %s: %s",
+                        run_root,
+                        error,
+                    )
+                result = ImageJobResult(
+                    source=probe.path,
+                    status=ImageStatus.FAILED,
+                    original_bytes=probe.size_bytes,
+                    original_dimensions=probe.dimensions,
+                    message="process_termination_unconfirmed",
+                    error_detail=(
+                        f"{exc}; marker_error={marker_error}"
+                        if marker_error is not None
+                        else str(exc)
+                    ),
+                    work_dir=work_dir,
+                )
+                exc.result = result
+                raise
+            except UserAbortError:
+                raise
+            except CompressorError as exc:
+                result = ImageJobResult(
+                    source=probe.path,
+                    status=ImageStatus.FAILED,
+                    original_bytes=probe.size_bytes,
+                    original_dimensions=probe.dimensions,
+                    message="canvas_preparation_failed",
+                    error_detail=str(exc),
+                    resized=probe.path in self.config.canvas_paths,
+                    padded=probe.path in self.config.canvas_paths,
                 )
                 return result
             finally:
                 reservation.release()
                 if work_dir is not None:
-                    keep = (
+                    keep = retain_run_root.is_set() or (
                         self.config.keep_temp_on_failure
                         and result is not None
                         and result.status
@@ -4239,7 +6750,8 @@ class BatchProcessor:
                         )
                     )
                     if keep:
-                        result.work_dir = work_dir
+                        if result is not None:
+                            result.work_dir = work_dir
                         self.logger.info(
                             "Retained failed-job workspace: %s",
                             work_dir,
@@ -4269,6 +6781,10 @@ class BatchProcessor:
                     probe = future_map[fut]
                     try:
                         res = fut.result()
+                    except ProcessTerminationError as exc:
+                        if exc.result is not None:
+                            results.append(exc.result)
+                        raise
                     except UserAbortError:
                         raise
                     except Exception as exc:
@@ -4303,7 +6819,11 @@ class BatchProcessor:
                             f"{human_bytes(res.original_bytes)}→{human_bytes(res.output_bytes)}"
                         ),
                     )
-        except (KeyboardInterrupt, UserAbortError) as exc:
+        except (
+            KeyboardInterrupt,
+            UserAbortError,
+            ProcessTerminationError,
+        ) as exc:
             self.config.cancellation.cancel()
             cancel_all = getattr(
                 self.engine.encoder.ffmpeg_encoder.runner,
@@ -4315,7 +6835,11 @@ class BatchProcessor:
             for future in future_map:
                 future.cancel()
             raise BatchInterruptedError(
-                "operation cancelled",
+                (
+                    "process termination could not be confirmed"
+                    if isinstance(exc, ProcessTerminationError)
+                    else "operation cancelled"
+                ),
                 results=results,
             ) from exc
         except BatchInterruptedError:
@@ -4348,21 +6872,31 @@ class BatchProcessor:
                 for reservation in destinations.values():
                     reservation.release()
                 if shutdown_complete:
-                    try:
-                        run_root.rmdir()
-                    except OSError:
-                        if not self.config.keep_temp_on_failure:
-                            self._cleanup_dir(run_root)
+                    self._collect_completed_results(
+                        future_map,
+                        results,
+                    )
+                if shutdown_complete and not retain_run_root.is_set():
+                    retained_failures = any(
+                        result.work_dir is not None
+                        for result in results
+                    )
+                    if retained_failures:
+                        try:
+                            mark_cleanup_safe()
+                        except OSError as exc:
+                            self.logger.warning(
+                                "Could not mark retained workspace for stale cleanup %s: %s",
+                                run_root,
+                                exc,
+                            )
+                    else:
+                        self._cleanup_dir(run_root)
                     parent = run_root.parent
                     try:
                         parent.rmdir()
                     except OSError:
                         pass
-            if self.config.cancellation.cancelled:
-                self._collect_completed_results(
-                    future_map,
-                    results,
-                )
             if shutdown_interrupted:
                 raise BatchInterruptedError(
                     "operation cancelled",
@@ -4371,6 +6905,64 @@ class BatchProcessor:
         order = {img.path: i for i, img in enumerate(images)}
         results.sort(key=lambda r: order.get(r.source, 10**9))
         return results
+
+    @staticmethod
+    def _work_dir_for(run_root: Path, source: Path) -> Path:
+        token = uuid.uuid4().hex[:10]
+        stem = safe_filename(source.stem, max_length=80)
+        if os.name == "nt":
+            try:
+                parent_length = len(str(run_root.resolve()))
+            except OSError:
+                parent_length = len(str(run_root.absolute()))
+            workspace_tail = len(token) + 2
+            candidate_tail = 1 + 24 + 1 + 16 + len(".webp")
+            available = (
+                WINDOWS_PATH_BUDGET
+                - parent_length
+                - workspace_tail
+                - candidate_tail
+            )
+            if available < 12:
+                raise WorkspaceError(
+                    f"Temporary run directory path is too long: {run_root}"
+                )
+            if len(stem) > available:
+                digest = hashlib.sha256(
+                    stem.encode("utf-8")
+                ).hexdigest()[:10]
+                prefix = stem[: max(1, available - len(digest) - 1)].rstrip(
+                    " ."
+                )
+                stem = f"{prefix or 'image'}_{digest}"
+        path = run_root / f"{stem}_{token}"
+        ensure_path_budget(path, label="Image workspace path")
+        return path
+
+    def _reclaim_stale_runs(self, parent: Path) -> None:
+        if not parent.is_dir():
+            return
+        try:
+            runs = list(parent.glob("run_*"))
+        except OSError:
+            return
+        for run in runs:
+            if (run / UNCONFIRMED_PROCESS_MARKER).exists():
+                continue
+            owner = run / ".owner.json"
+            try:
+                payload = json.loads(owner.read_text(encoding="utf-8"))
+                pid = int(payload.get("pid", 0))
+                cleanup_safe = payload.get("cleanup_safe") is True
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                continue
+            if (
+                pid <= 0
+                or not cleanup_safe
+                or OutputPlanner._pid_is_running(pid)
+            ):
+                continue
+            self._cleanup_dir(run)
 
     @staticmethod
     def _collect_completed_results(
@@ -4386,6 +6978,10 @@ class BatchProcessor:
                 continue
             try:
                 completed = future.result()
+            except ProcessTerminationError as exc:
+                completed = exc.result
+                if completed is None:
+                    continue
             except BaseException as exc:
                 if isinstance(exc, (SystemExit, GeneratorExit)):
                     raise
@@ -4401,7 +6997,6 @@ class BatchProcessor:
             return
         except OSError as exc:
             self.logger.warning("Could not clean temporary directory %s: %s", path, exc)
-
 
 class ReportWriter:
 
@@ -4483,12 +7078,96 @@ class Application:
         return script_dir
 
     def run(self) -> int:
+        return self._run(interactive=True)
+
+    def run_headless(
+        self,
+        namespace: argparse.Namespace,
+    ) -> int:
+        self.root = namespace.input.resolve()
+        return self._run(interactive=False, namespace=namespace)
+
+    @staticmethod
+    def _merge_results(
+        results: Sequence[ImageJobResult],
+        replacements: Sequence[ImageJobResult],
+        images: Sequence[ImageProbeResult],
+    ) -> List[ImageJobResult]:
+        replacement_map = {result.source: result for result in replacements}
+        merged = [replacement_map.get(result.source, result) for result in results]
+        order = {image.path: index for index, image in enumerate(images)}
+        merged.sort(key=lambda result: order.get(result.source, 10**9))
+        return merged
+
+    @staticmethod
+    def _remove_published_results(
+        results: Sequence[ImageJobResult],
+        output_dir: Path,
+    ) -> None:
+        for result in results:
+            path = result.output_path
+            if path is None or not is_within_directory(path, output_dir):
+                continue
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as exc:
+                raise WorkspaceError(f"cannot remove prior run output {path}: {exc}") from exc
+            result.output_path = None
+
+    def _run_all_resize_mode(
+        self,
+        processor: BatchProcessor,
+        images: Sequence[ImageProbeResult],
+        config: RuntimeConfig,
+        *,
+        reuse_destinations: bool,
+    ) -> List[ImageJobResult]:
+        results = processor.run(images, reuse_destinations=reuse_destinations)
+        while any(result.status == ImageStatus.SIZE_LIMIT_FAILED for result in results):
+            if config.page_canvas is None:
+                break
+            reduced = PageCanvasPlanner.reduce_uniformly(
+                config.page_canvas,
+                config.minimum_page_side,
+            )
+            if reduced is None:
+                break
+            self._remove_published_results(results, config.output_dir)
+            config.page_canvas = reduced
+            config.uniform_reduction_applied = True
+            config.reprocess_existing = True
+            self.logger.info("Uniform page canvas reduction to %s", reduced)
+            self.cli.print(
+                f"[warning]{rich_escape(t('uniform_reduce', canvas=reduced))}[/warning]"
+            )
+            results = processor.run(images, reuse_destinations=True)
+        return results
+
+    def _run(
+        self,
+        *,
+        interactive: bool,
+        namespace: Optional[argparse.Namespace] = None,
+    ) -> int:
         started = datetime.now(timezone.utc)
         t0 = time.perf_counter()
         cancellation = CancellationToken()
         try:
-            self.cli.select_language()
-            self.cli.banner()
+            if interactive:
+                self.cli.select_language()
+            else:
+                if namespace is None:
+                    raise CompressorError("headless arguments are missing")
+                set_language(namespace.language)
+            size_policy = (
+                SizePolicy(
+                    strict_max_bytes=namespace.max_bytes,
+                    preferred_target_bytes=namespace.preferred_bytes,
+                )
+                if namespace is not None
+                else SizePolicy()
+            )
+            self.cli.banner(size_policy)
         except KeyboardInterrupt:
             cancellation.cancel()
             raise UserAbortError("operation cancelled")
@@ -4501,7 +7180,7 @@ class Application:
         except BinaryNotFoundError as exc:
             self.cli.print(f"[error]{rich_escape(str(exc))}[/error]")
             return 2
-        size_policy = SizePolicy()
+
         self.cli.show_environment(
             self.root,
             ffmpeg,
@@ -4510,9 +7189,27 @@ class Application:
             locator.ffprobe_version,
             size_policy,
         )
-        output_dir = self.root / DEFAULT_OUTPUT_DIRNAME
+        output_dir = (
+            namespace.output.resolve()
+            if namespace is not None
+            else self.root / DEFAULT_OUTPUT_DIRNAME
+        )
         log_path = output_dir / REPORT_LOG_NAME
+        report_path = output_dir / REPORT_JSON_NAME
         try:
+            ensure_path_budget(log_path, label="Log path")
+            ensure_path_budget(report_path, label="Report path")
+            ensure_path_budget(
+                output_dir / f"report_{'0' * 16}.json",
+                label="Report staging path",
+            )
+            ensure_path_budget(
+                output_dir
+                / TEMP_WORKDIR_NAME
+                / f"run_{'0' * 16}"
+                / ".owner.json",
+                label="Temporary run path",
+            )
             output_dir.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             self.cli.print(
@@ -4530,7 +7227,18 @@ class Application:
         self.logger.info("ffprobe: %s", ffprobe)
         self.logger.info("Language: %s", ACTIVE_LANG)
         runner = SubprocessRunner(self.logger, cancellation=cancellation)
-        prober = ImageProber(ffprobe, runner, self.logger)
+        capabilities = BinaryLocator.probe_capabilities(ffmpeg, runner)
+        max_pixels = (
+            namespace.max_pixels
+            if namespace is not None
+            else DEFAULT_MAX_PIXELS
+        )
+        configure_pillow_pixel_limit(max_pixels)
+        prober = ImageProber(
+            ffprobe,
+            runner,
+            max_pixels=max_pixels,
+        )
         scanner = PreflightScanner(
             self.root,
             prober,
@@ -4544,7 +7252,18 @@ class Application:
             f"\n[info]{rich_escape(t('preflight_running'))}[/info]"
         )
         try:
-            summary = scanner.scan(max_workers=DEFAULT_MAX_WORKERS)
+            summary = scanner.scan(
+                max_workers=(
+                    namespace.workers
+                    if namespace is not None
+                    else DEFAULT_MAX_WORKERS
+                ),
+                recursive=(
+                    namespace.recursive
+                    if namespace is not None
+                    else False
+                ),
+            )
         except KeyboardInterrupt:
             cancellation.cancel()
             runner.cancel_all()
@@ -4557,67 +7276,271 @@ class Application:
                 f"[warning]{rich_escape(t('no_images', exts=', '.join(sorted(SUPPORTED_EXTENSIONS))))}[/warning]"
             )
             return 0
+        available_codecs = available_output_codecs(capabilities)
+        available_choices = [
+            choice
+            for choice in OutputFormatChoice
+            if output_choice_available(choice, summary, available_codecs)
+        ]
+        if not available_choices:
+            self.cli.print(
+                f"[error]{rich_escape(t('unavailable_format', format='JPG/PNG/WEBP'))}[/error]"
+            )
+            return 2
         try:
             self.cli.show_preflight(summary)
-            strategy = self.cli.select_strategy(summary)
-            self.logger.info("User selected strategy: %s", strategy.name)
-            output_format = self.cli.select_output_format()
-            self.logger.info("User selected output format: %s", output_format.name)
-            if not self.cli.confirm_start(strategy, summary.over_limit_count):
-                self.cli.print(
-                    f"[warning]{rich_escape(t('aborted_user'))}[/warning]"
+            if interactive:
+                strategy = self.cli.select_strategy(summary)
+                self.logger.info("User selected strategy: %s", strategy.name)
+                output_format = self.cli.select_output_format(
+                    summary,
+                    available_choices,
                 )
-                return 0
-            max_workers = DEFAULT_MAX_WORKERS
-            if RICH_AVAILABLE and self.cli.console is not None:
-                try:
-                    max_workers = IntPrompt.ask(
-                        t("parallel_workers"), default=DEFAULT_MAX_WORKERS, console=self.cli.console
+                self.logger.info("User selected output format: %s", output_format.name)
+                if not self.cli.confirm_start(strategy, summary.over_limit_count):
+                    self.cli.print(
+                        f"[warning]{rich_escape(t('aborted_user'))}[/warning]"
                     )
-                    max_workers = clamp(int(max_workers), 1, 32)
-                except (ValueError, TypeError):
-                    max_workers = DEFAULT_MAX_WORKERS
+                    return 0
+                max_workers = DEFAULT_MAX_WORKERS
+                if RICH_AVAILABLE and self.cli.console is not None:
+                    try:
+                        max_workers = IntPrompt.ask(
+                            t("parallel_workers"),
+                            default=DEFAULT_MAX_WORKERS,
+                            console=self.cli.console,
+                        )
+                        max_workers = clamp(int(max_workers), 1, 32)
+                    except (ValueError, TypeError):
+                        max_workers = DEFAULT_MAX_WORKERS
+                else:
+                    raw = input(
+                        f"{t('parallel_workers')} [{DEFAULT_MAX_WORKERS}]: "
+                    ).strip()
+                    if raw.isdigit():
+                        max_workers = clamp(int(raw), 1, 32)
             else:
-                raw = input(f"{t('parallel_workers')} [{DEFAULT_MAX_WORKERS}]: ").strip()
-                if raw.isdigit():
-                    max_workers = clamp(int(raw), 1, 32)
+                if namespace is None:
+                    raise CompressorError("headless arguments are missing")
+                strategy = CompressionStrategy[namespace.strategy]
+                output_format = OutputFormatChoice[namespace.output_format]
+                max_workers = namespace.workers
         except KeyboardInterrupt:
             cancellation.cancel()
             runner.cancel_all()
             raise UserAbortError("operation cancelled")
+        if not output_choice_available(output_format, summary, available_codecs):
+            self.cli.print(
+                f"[error]{rich_escape(t('unavailable_format', format=output_format.name))}[/error]"
+            )
+            return 2
+        page_plan: Optional[PageCanvasPlan] = None
+        resize_mode = ResizeMode.NONE
+        if interactive:
+            try:
+                page_plan = PageCanvasPlanner.create(summary.images)
+            except CompressorError:
+                self.cli.print(
+                    f"[warning]{rich_escape(t('canvas_unavailable'))}[/warning]"
+                )
+            if page_plan and (page_plan.outliers or summary.over_limit_count):
+                resize_mode = self.cli.select_resize_mode()
+        else:
+            if namespace is None:
+                raise CompressorError("headless arguments are missing")
+            resize_mode = ResizeMode(namespace.resize_mode)
+            if resize_mode != ResizeMode.NONE:
+                try:
+                    page_plan = PageCanvasPlanner.create(
+                        summary.images,
+                        namespace.page_size,
+                    )
+                except CompressorError as exc:
+                    self.cli.print(f"[error]{rich_escape(str(exc))}[/error]")
+                    return 2
+        if resize_mode != ResizeMode.NONE:
+            if page_plan is None:
+                self.cli.print(
+                    f"[error]{rich_escape(t('canvas_unavailable'))}[/error]"
+                )
+                return 2
+            if ImageCodec.PNG not in pillow_output_codecs():
+                self.cli.print(
+                    f"[error]{rich_escape(t('resize_requires_pillow'))}[/error]"
+                )
+                return 2
+            canvas_message_key = (
+                "page_size_provided"
+                if page_plan.source == "user-provided"
+                else "page_size_auto"
+            )
+            self.cli.print(
+                f"[info]{rich_escape(t(canvas_message_key, canvas=page_plan.canvas))}[/info]"
+            )
+        if strategy == CompressionStrategy.COPY_ONLY_UNDER_LIMIT and resize_mode != ResizeMode.NONE:
+            self.cli.print(
+                f"[error]{rich_escape('COPY_ONLY_UNDER_LIMIT is incompatible with page resizing')}[/error]"
+            )
+            return 2
+        readable_paths = frozenset(
+            image.path for image in summary.images if image.is_readable
+        )
+        canvas_paths = (
+            readable_paths
+            if resize_mode == ResizeMode.ALL
+            else page_plan.outliers
+            if resize_mode == ResizeMode.OUTLIERS and page_plan is not None
+            else frozenset()
+        )
+        minimum_page_side = (
+            min(MIN_AUTOMATIC_PAGE_SIDE, min(page_plan.canvas.width, page_plan.canvas.height))
+            if page_plan and page_plan.source == "user-provided"
+            else MIN_AUTOMATIC_PAGE_SIDE
+        )
         config = RuntimeConfig(
             root_dir=self.root,
             output_dir=output_dir,
             size_policy=size_policy,
             strategy=strategy,
             max_workers=max_workers,
-            allow_downscale=False,
+            max_pixels=max_pixels,
+            resize_mode=resize_mode,
+            page_canvas_source=page_plan.source if page_plan else None,
+            page_canvas=page_plan.canvas if page_plan else None,
+            initial_page_canvas=page_plan.canvas if page_plan else None,
+            minimum_page_side=minimum_page_side,
+            allow_upscale=bool(namespace is not None and namespace.allow_upscale),
+            canvas_paths=canvas_paths,
+            recursive=bool(namespace is not None and namespace.recursive),
             copy_under_limit=True,
-            overwrite_output=False,
-            strip_metadata=True,
-            preserve_icc_profile=True,
-            progressive_jpeg=True,
+            overwrite_output=bool(
+                namespace is not None and namespace.overwrite
+            ),
+            dry_run=bool(namespace is not None and namespace.dry_run),
+            strip_metadata=(
+                not namespace.keep_metadata
+                if namespace is not None
+                else True
+            ),
+            preserve_icc_profile=(
+                not namespace.discard_icc
+                if namespace is not None
+                else True
+            ),
+            progressive_jpeg=(
+                not namespace.baseline_jpeg
+                if namespace is not None
+                else True
+            ),
             include_convertibles=True,
             output_format=output_format,
+            runtime_metadata={
+                "ffmpeg_version": locator.ffmpeg_version,
+                "ffprobe_version": locator.ffprobe_version,
+                "ffmpeg_capabilities": capabilities.to_dict(),
+            },
             cancellation=cancellation,
         )
-        ffmpeg_enc = FFmpegEncoder(ffmpeg, runner, self.logger)
+        if config.progressive_jpeg and ImageCodec.JPG not in pillow_output_codecs() and (
+            output_format == OutputFormatChoice.JPG
+            or (
+                output_format == OutputFormatChoice.KEEP_ORIGINAL
+                and any(image.is_jpeg for image in summary.images if image.is_readable)
+            )
+        ):
+            self.cli.print(
+                f"[warning]{rich_escape(t('baseline_jpeg_fallback'))}[/warning]"
+            )
+        ffmpeg_enc = FFmpegEncoder(
+            ffmpeg,
+            runner,
+            capabilities=capabilities,
+        )
         pillow_enc: Optional[PillowEncoder] = None
         if PILLOW_AVAILABLE:
             try:
                 pillow_enc = PillowEncoder(
-                    self.logger,
                     cancellation=cancellation,
+                    max_pixels=config.max_pixels,
                 )
             except CompressorError:
                 pillow_enc = None
-        dual = DualEncoder(ffmpeg_enc, pillow_enc, self.logger)
-        engine = StrategyEngine(dual, self.logger, config)
+        dual = DualEncoder(ffmpeg_enc, pillow_enc)
+        verifier = OutputVerifier(
+            ffmpeg,
+            ffprobe,
+            runner,
+            max_pixels=config.max_pixels,
+        )
+        engine = StrategyEngine(
+            dual,
+            self.logger,
+            config,
+            verifier=verifier,
+        )
         processor = BatchProcessor(config, engine, self.logger, self.cli)
         self.cli.rule(rich_escape(t("rule_processing")))
         interrupted = False
         try:
-            results = processor.run(summary.images)
+            if config.resize_mode == ResizeMode.ALL:
+                results = self._run_all_resize_mode(
+                    processor,
+                    summary.images,
+                    config,
+                    reuse_destinations=False,
+                )
+            else:
+                results = processor.run(summary.images)
+            if config.resize_mode == ResizeMode.OUTLIERS:
+                native_failures = {
+                    result.source
+                    for result in results
+                    if result.status == ImageStatus.SIZE_LIMIT_FAILED
+                    and result.source not in config.canvas_paths
+                }
+                if native_failures:
+                    config.canvas_paths = frozenset(
+                        set(config.canvas_paths) | native_failures
+                    )
+                    config.reprocess_existing = True
+                    retry_images = [
+                        image
+                        for image in summary.images
+                        if image.path in native_failures
+                    ]
+                    replacements = processor.run(
+                        retry_images,
+                        reuse_destinations=True,
+                    )
+                    results = self._merge_results(
+                        results,
+                        replacements,
+                        summary.images,
+                    )
+                affected_failures = [
+                    result
+                    for result in results
+                    if result.source in config.canvas_paths
+                    and result.status
+                    in (ImageStatus.SIZE_LIMIT_FAILED, ImageStatus.FAILED)
+                ]
+                if affected_failures:
+                    self.cli.print(
+                        f"[warning]{rich_escape(t('outlier_resize_failed'))}[/warning]"
+                    )
+                    if interactive and self.cli.confirm_switch_to_all():
+                        self._remove_published_results(results, config.output_dir)
+                        config.resize_mode = ResizeMode.ALL
+                        config.page_canvas = config.initial_page_canvas
+                        config.canvas_paths = readable_paths
+                        config.uniform_reduction_applied = False
+                        config.reprocess_existing = True
+                        results = self._run_all_resize_mode(
+                            processor,
+                            summary.images,
+                            config,
+                            reuse_destinations=True,
+                        )
         except BatchInterruptedError as exc:
             interrupted = True
             results = exc.results
@@ -4645,7 +7568,7 @@ class Application:
         writer = ReportWriter(self.logger)
         writer.write_json(
             report,
-            output_dir / REPORT_JSON_NAME,
+            report_path,
             cancellation=None if interrupted else cancellation,
         )
         self.cli.show_batch_report(report)
@@ -4685,6 +7608,72 @@ class Application:
         return 5
 
 
+def build_argument_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="jpeg_compressor")
+    parser.add_argument("--input", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--language", choices=("en", "vi"), default="en")
+    parser.add_argument(
+        "--strategy",
+        choices=tuple(strategy.name for strategy in CompressionStrategy),
+        default=CompressionStrategy.AGGRESSIVE_ADAPTIVE.name,
+    )
+    parser.add_argument(
+        "--output-format",
+        choices=tuple(choice.name for choice in OutputFormatChoice),
+        default=OutputFormatChoice.KEEP_ORIGINAL.name,
+    )
+    parser.add_argument("--workers", type=int, default=DEFAULT_MAX_WORKERS)
+    parser.add_argument("--max-bytes", type=int, default=DEFAULT_MAX_BYTES)
+    parser.add_argument(
+        "--preferred-bytes",
+        type=int,
+        default=EFFECTIVE_TARGET_BYTES,
+    )
+    parser.add_argument("--max-pixels", type=int, default=DEFAULT_MAX_PIXELS)
+    parser.add_argument("--recursive", action="store_true")
+    parser.add_argument(
+        "--resize-mode",
+        choices=tuple(mode.value for mode in ResizeMode),
+        default=ResizeMode.NONE.value,
+    )
+    parser.add_argument("--page-size", type=parse_page_size)
+    parser.add_argument("--allow-upscale", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--keep-metadata", action="store_true")
+    parser.add_argument("--discard-icc", action="store_true")
+    parser.add_argument("--baseline-jpeg", action="store_true")
+    return parser
+
+
+def parse_headless_args(argv: Sequence[str]) -> argparse.Namespace:
+    parser = build_argument_parser()
+    namespace = parser.parse_args(list(argv))
+    namespace.workers = clamp(namespace.workers, 1, 32)
+    if not namespace.input.is_dir():
+        parser.error(f"input directory does not exist: {namespace.input}")
+    if namespace.max_pixels <= 0:
+        parser.error("--max-pixels must be positive")
+    if namespace.resize_mode == ResizeMode.NONE.value and namespace.page_size is not None:
+        parser.error("--page-size requires --resize-mode all or outliers")
+    if namespace.resize_mode == ResizeMode.NONE.value and namespace.allow_upscale:
+        parser.error("--allow-upscale requires --resize-mode all or outliers")
+    if (
+        namespace.strategy == CompressionStrategy.COPY_ONLY_UNDER_LIMIT.name
+        and namespace.resize_mode != ResizeMode.NONE.value
+    ):
+        parser.error("COPY_ONLY_UNDER_LIMIT cannot be used with page resizing")
+    try:
+        SizePolicy(
+            strict_max_bytes=namespace.max_bytes,
+            preferred_target_bytes=namespace.preferred_bytes,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+    return namespace
+
+
 def _pause_if_windows_double_click(*, interrupted: bool = False) -> None:
     if sys.platform != "win32" or interrupted:
         return
@@ -4696,11 +7685,16 @@ def _pause_if_windows_double_click(*, interrupted: bool = False) -> None:
         pass
 
 
-def main() -> int:
+def main(argv: Optional[Sequence[str]] = None) -> int:
     exit_code = 1
+    arguments = list(sys.argv[1:] if argv is None else argv)
     try:
         app = Application()
-        exit_code = app.run()
+        exit_code = (
+            app.run_headless(parse_headless_args(arguments))
+            if arguments
+            else app.run()
+        )
     except UserAbortError:
         exit_code = 130
         print(f"\n{t('stopped_by_user')}")
@@ -4712,11 +7706,12 @@ def main() -> int:
         print(t("error_prefix", exc=exc), file=sys.stderr)
     except CompressorError as exc:
         exit_code = 1
+        logging.getLogger("jpeg_compressor").error("%s", exc)
         print(t("error_prefix", exc=exc), file=sys.stderr)
-        traceback.print_exc()
-    except Exception:
+    except Exception as exc:
         exit_code = 1
-        traceback.print_exc()
+        logging.getLogger("jpeg_compressor").exception("Unexpected failure")
+        print(t("error_prefix", exc=exc), file=sys.stderr)
     finally:
         no_pause = os.environ.get(
             "JPEG_COMPRESSOR_NO_PAUSE",
@@ -4725,7 +7720,6 @@ def main() -> int:
         if not no_pause:
             _pause_if_windows_double_click(interrupted=exit_code == 130)
     return exit_code
-
 
 if __name__ == "__main__":
     sys.exit(main())
