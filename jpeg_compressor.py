@@ -21,6 +21,7 @@ from collections import Counter
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
+from decimal import Decimal
 from datetime import datetime, timezone
 from enum import Enum, auto
 from pathlib import Path
@@ -91,6 +92,8 @@ SCRIPT_VERSION: Final[str] = "1.7.0"
 SCRIPT_NAME: Final[str] = "JPEG Batch Compressor"
 TARGET_SIZE_MB: Final[float] = 4.95
 DEFAULT_MAX_BYTES: Final[int] = int(TARGET_SIZE_MB * 1_000_000)
+DEFAULT_WEBSITE_LIMIT_MB: Final[int] = 5
+WEBSITE_LIMIT_HEADROOM_BYTES: Final[int] = 50_000
 DEFAULT_OUTPUT_DIRNAME: Final[str] = "compressed_output"
 TEMP_WORKDIR_NAME: Final[str] = ".tmp_compress_work"
 UNCONFIRMED_PROCESS_MARKER: Final[str] = ".process-unconfirmed"
@@ -253,6 +256,9 @@ UI_TEXT: Final[Dict[str, Dict[str, str]]] = {
         "recommended_paren": " (recommended)",
         "confirm_proceed": "Proceed with {title} on {n} oversize file(s)?",
         "continue_yn": "Continue? [Y/n]:",
+        "max_size_prompt": "Website maximum image size in MB (for example 5, 10, or 15)",
+        "max_size_invalid": "Enter a valid size greater than 0.06 MB.",
+        "max_size_effective": "Working compression limit: <{effective_mb} MB for the website limit <{website_mb} MB.",
         "resize_prompt": "Choose chapter page resizing",
         "resize_all": "Resize and pad all pages to the common canvas",
         "resize_outliers": "Resize only geometry outliers and native failures",
@@ -413,6 +419,9 @@ UI_TEXT: Final[Dict[str, Dict[str, str]]] = {
         "recommended_paren": " (khuyến nghị)",
         "confirm_proceed": "Tiếp tục với {title} trên {n} file vượt size?",
         "continue_yn": "Tiếp tục? [Y/n]:",
+        "max_size_prompt": "Dung lượng ảnh tối đa website cho phép tính theo MB (ví dụ 5, 10 hoặc 15)",
+        "max_size_invalid": "Hãy nhập dung lượng hợp lệ lớn hơn 0,06 MB.",
+        "max_size_effective": "Giới hạn nén thực tế: <{effective_mb} MB cho giới hạn website <{website_mb} MB.",
         "resize_prompt": "Chọn cách đổi kích thước trang",
         "resize_all": "Đổi và đệm tất cả trang theo khung chung",
         "resize_outliers": "Chỉ đổi trang lệch chuẩn và trang lỗi ở kích thước gốc",
@@ -491,14 +500,15 @@ UI_TEXT: Final[Dict[str, Dict[str, str]]] = {
     },
 }
 ACTIVE_LANG: str = "en"
+ACTIVE_MAX_BYTES: int = DEFAULT_MAX_BYTES
 
 
 def t(key: str, **kwargs: Any) -> str:
     bundle = UI_TEXT.get(ACTIVE_LANG) or UI_TEXT["en"]
     template = bundle.get(key) or UI_TEXT["en"].get(key, key)
     merged: Dict[str, Any] = {
-        "target_mb": f"{TARGET_SIZE_MB:g}",
-        "target_bytes": f"{DEFAULT_MAX_BYTES:,}",
+        "target_mb": f"{ACTIVE_MAX_BYTES / 1_000_000:g}",
+        "target_bytes": f"{ACTIVE_MAX_BYTES:,}",
     }
     merged.update(kwargs)
     try:
@@ -787,6 +797,29 @@ class SizePolicy:
 
 
 DEFAULT_SIZE_POLICY: Final[SizePolicy] = SizePolicy()
+
+
+def size_policy_from_website_limit(value: str) -> SizePolicy:
+    match = re.fullmatch(
+        r"\s*(\d+(?:[.,]\d+)?)\s*(?:mb)?\s*",
+        value,
+        flags=re.IGNORECASE,
+    )
+    if match is None:
+        raise ValueError("invalid website size limit")
+    website_limit_mb = Decimal(match.group(1).replace(",", "."))
+    website_limit_bytes = int(website_limit_mb * 1_000_000)
+    strict_max_bytes = website_limit_bytes - WEBSITE_LIMIT_HEADROOM_BYTES
+    preferred_target_bytes = strict_max_bytes - SIZE_SAFETY_MARGIN_BYTES
+    return SizePolicy(
+        strict_max_bytes=strict_max_bytes,
+        preferred_target_bytes=preferred_target_bytes,
+    )
+
+
+def set_active_size_policy(policy: SizePolicy) -> None:
+    global ACTIVE_MAX_BYTES
+    ACTIVE_MAX_BYTES = policy.strict_max_bytes
 
 
 class CancellationToken:
@@ -5725,6 +5758,37 @@ class CLI:
                     return
                 print(t("invalid_selection"))
 
+    def select_size_policy(self) -> SizePolicy:
+        default_value = str(DEFAULT_WEBSITE_LIMIT_MB)
+        while True:
+            if self.console is not None:
+                raw = Prompt.ask(
+                    t("max_size_prompt"),
+                    default=default_value,
+                    console=self.console,
+                )
+            else:
+                raw = input(
+                    f"{t('max_size_prompt')} [{default_value}]: "
+                ).strip() or default_value
+            try:
+                policy = size_policy_from_website_limit(raw)
+            except ValueError:
+                self.print(f"[error]{rich_escape(t('max_size_invalid'))}[/error]")
+                continue
+            website_limit_mb = (
+                policy.strict_max_bytes + WEBSITE_LIMIT_HEADROOM_BYTES
+            ) / 1_000_000
+            effective_message = t(
+                "max_size_effective",
+                effective_mb=f"{policy.strict_max_bytes / 1_000_000:g}",
+                website_mb=f"{website_limit_mb:g}",
+            )
+            self.print(
+                f"[info]{rich_escape(effective_message)}[/info]"
+            )
+            return policy
+
     def banner(self, size_policy: SizePolicy = DEFAULT_SIZE_POLICY) -> None:
         title = f"{SCRIPT_NAME} v{SCRIPT_VERSION}"
         subtitle = t(
@@ -7112,18 +7176,16 @@ class Application:
         try:
             if interactive:
                 self.cli.select_language()
+                size_policy = self.cli.select_size_policy()
             else:
                 if namespace is None:
                     raise CompressorError("headless arguments are missing")
                 set_language(namespace.language)
-            size_policy = (
-                SizePolicy(
+                size_policy = SizePolicy(
                     strict_max_bytes=namespace.max_bytes,
                     preferred_target_bytes=namespace.preferred_bytes,
                 )
-                if namespace is not None
-                else SizePolicy()
-            )
+            set_active_size_policy(size_policy)
             self.cli.banner(size_policy)
         except KeyboardInterrupt:
             cancellation.cancel()
